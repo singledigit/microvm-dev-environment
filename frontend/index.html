@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Claude Code</title>
+  <script>window.TOKEN_API_URL = 'https://dolumfmgph.execute-api.us-east-1.amazonaws.com/prod/token';</script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: #0d1117;
+      color: #e0e0e0;
+      font-family: -apple-system, 'SF Pro Text', sans-serif;
+      overflow: hidden;
+    }
+    /* Login screen */
+    #login-screen {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      height: 100dvh;
+      background: #0d1117;
+      padding: 24px;
+    }
+    #login-screen h1 {
+      font-size: 28px;
+      font-weight: 700;
+      color: #58a6ff;
+      margin-bottom: 8px;
+    }
+    #login-screen p {
+      color: #8b949e;
+      font-size: 14px;
+      margin-bottom: 32px;
+    }
+    .login-form {
+      width: 100%;
+      max-width: 360px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .login-form input {
+      width: 100%;
+      padding: 14px 16px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      color: #e0e0e0;
+      font-size: 16px;
+      outline: none;
+      -webkit-appearance: none;
+    }
+    .login-form input:focus { border-color: #58a6ff; }
+    .login-form button {
+      width: 100%;
+      padding: 14px;
+      background: #238636;
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .login-form button:active { background: #2ea043; }
+    #login-error {
+      color: #f85149;
+      font-size: 13px;
+      text-align: center;
+      min-height: 18px;
+    }
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      height: 100dvh;
+    }
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      flex-shrink: 0;
+      min-height: 44px;
+    }
+    #header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #e94560;
+      letter-spacing: 0.5px;
+    }
+    #status {
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      background: #0f3460;
+      color: #a8b2d8;
+    }
+    #status.connected { background: #1a4a1a; color: #4caf50; }
+    #status.error { background: #4a1a1a; color: #f44336; }
+    #terminal-container {
+      flex: 1;
+      overflow: hidden;
+      padding: 4px;
+      min-height: 0;
+      position: relative;
+    }
+    #terminal {
+      width: 100%;
+      height: 100%;
+    }
+    #loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: absolute;
+      inset: 0;
+      background: #0d1117;
+      gap: 16px;
+      color: #a8b2d8;
+      z-index: 10;
+    }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #0f3460;
+      border-top-color: #e94560;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error-banner {
+      display: none;
+      padding: 12px 16px;
+      background: #4a1a1a;
+      color: #f44336;
+      font-size: 13px;
+      text-align: center;
+    }
+    #reconnect-btn {
+      margin-top: 12px;
+      padding: 8px 20px;
+      background: #e94560;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    /* iOS safe area */
+    @supports (padding: env(safe-area-inset-bottom)) {
+      #app { padding-bottom: env(safe-area-inset-bottom); }
+    }
+  </style>
+</head>
+<body>
+<!-- Login screen (shown first) -->
+<div id="login-screen">
+  <h1>Claude Code</h1>
+  <p>iPad Sandbox</p>
+  <div class="login-form">
+    <input type="email" id="login-email" placeholder="Email" autocomplete="email" inputmode="email">
+    <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+    <div id="login-error"></div>
+    <button id="login-btn" onclick="doLogin()">Sign In</button>
+  </div>
+</div>
+
+<!-- Terminal app (shown after login) -->
+<div id="app" style="display:none; height:100%; height:100dvh; flex-direction:column;">
+  <div id="header">
+    <h1>Claude Code</h1>
+    <span id="status">Connecting…</span>
+  </div>
+  <div id="error-banner"></div>
+  <div id="terminal-container">
+    <div id="loading">
+      <div class="spinner"></div>
+      <div id="loading-msg">Loading terminal…</div>
+    </div>
+    <div id="terminal"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+<script>
+// ── Config ──────────────────────────────────────────────────────────────────
+const TOKEN_API_URL = window.TOKEN_API_URL || document.querySelector('meta[name="token-api-url"]')?.content || '';
+
+// ── Login / session persistence ───────────────────────────────────────────────
+const STORAGE_KEY = 'ipadclaude_session';
+let sessionPassword = null;
+
+function loadSavedSession() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+
+function saveSession(email, password) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ email, password }));
+}
+
+function clearSession() {
+  localStorage.removeItem(STORAGE_KEY);
+  sessionPassword = null;
+}
+
+async function doLogin() {
+  const email = document.getElementById('login-email').value.trim();
+  const password = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error');
+  const btn = document.getElementById('login-btn');
+
+  errEl.textContent = '';
+  if (!email || !password) { errEl.textContent = 'Enter email and password.'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+
+  try {
+    const resp = await fetch(`${TOKEN_API_URL}?auth=1`, {
+      headers: { 'X-Login-Email': email, 'X-Login-Password': password },
+    });
+    if (resp.status === 401) { errEl.textContent = 'Invalid credentials.'; return; }
+    if (!resp.ok) { errEl.textContent = `Error ${resp.status}. Try again.`; return; }
+
+    sessionPassword = password;
+    saveSession(email, password);
+    showApp();
+  } catch (e) {
+    errEl.textContent = `Network error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+}
+
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  start();
+}
+
+// Allow Enter key on password field
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('login-password')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+  });
+
+  // Auto-login if we have a saved session
+  const saved = loadSavedSession();
+  if (saved && saved.password) {
+    sessionPassword = saved.password;
+    // Pre-fill email for visual confirmation, then skip login
+    const emailEl = document.getElementById('login-email');
+    if (emailEl) emailEl.value = saved.email || '';
+    showApp();
+  }
+});
+
+// ── State ────────────────────────────────────────────────────────────────────
+let terminal, fitAddon, ws;
+let authToken = null, mvmEndpoint = null;
+let tokenExpiresAt = 0;
+let refreshTimer = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let pingTimer = null;
+let lastPong = 0;
+
+const statusEl = document.getElementById('status');
+const loadingEl = document.getElementById('loading');
+const loadingMsgEl = document.getElementById('loading-msg');
+const terminalContainerEl = document.getElementById('terminal');
+const errorBannerEl = document.getElementById('error-banner');
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || '';
+}
+
+function showError(msg, showReconnect = true) {
+  errorBannerEl.style.display = 'block';
+  errorBannerEl.innerHTML = msg + (showReconnect
+    ? '<br><button id="reconnect-btn" onclick="reconnect()">Reconnect</button>' : '');
+}
+
+function clearError() {
+  errorBannerEl.style.display = 'none';
+}
+
+// ── Token fetch ──────────────────────────────────────────────────────────────
+async function fetchToken() {
+  const headers = sessionPassword ? { 'X-Login-Password': sessionPassword } : {};
+  const resp = await fetch(TOKEN_API_URL, { headers });
+  if (!resp.ok) throw new Error(`Token API ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  authToken = data.authToken;
+  mvmEndpoint = data.endpoint;
+  tokenExpiresAt = Date.now() + data.expiresInSeconds * 1000;
+
+  // Schedule refresh 5 min before expiry
+  const refreshIn = (data.expiresInSeconds - 300) * 1000;
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refreshToken, Math.max(refreshIn, 30000));
+
+  return data;
+}
+
+async function refreshToken() {
+  try {
+    await fetchToken();
+    // Re-negotiate if the WS is still open — ttyd will continue the session
+    // The token is only used at connection setup, so no mid-session disruption needed.
+    console.log('Token refreshed, valid for another 55 min');
+  } catch (e) {
+    console.warn('Token refresh failed:', e);
+  }
+}
+
+// ── Terminal init ────────────────────────────────────────────────────────────
+function initTerminal() {
+  terminal = new Terminal({
+    theme: {
+      background: '#0d1117',
+      foreground: '#c9d1d9',
+      cursor: '#58a6ff',
+      black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
+      blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
+      brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
+      brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+      brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
+    },
+    fontFamily: '"SF Mono", "Fira Code", Menlo, monospace',
+    fontSize: 14,
+    lineHeight: 1.3,
+    scrollback: 5000,
+    cursorBlink: true,
+    allowTransparency: false,
+    macOptionIsMeta: true,
+  });
+
+  fitAddon = new FitAddon.FitAddon();
+  terminal.loadAddon(fitAddon);
+  terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+  terminal.open(terminalContainerEl);
+  fitAddon.fit();
+
+  // Click/tap anywhere on terminal to ensure keyboard focus
+  terminalContainerEl.addEventListener('click', () => terminal.focus());
+  terminalContainerEl.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    terminal.focus();
+  }, { passive: false });
+
+  // Resize on window resize and orientation change
+  const resizeObserver = new ResizeObserver(() => {
+    try { fitAddon.fit(); } catch {}
+  });
+  resizeObserver.observe(document.getElementById('terminal-container'));
+  window.addEventListener('orientationchange', () => setTimeout(() => fitAddon.fit(), 300));
+
+  // Register input handlers once — ws is a module-level var so they always use the current connection
+  terminal.onData((data) => {
+    if (!ws || ws.readyState !== 1) return;
+    const encoded = new TextEncoder().encode(data);
+    const msg = new Uint8Array(1 + encoded.length);
+    msg[0] = 0x30;
+    msg.set(encoded, 1);
+    ws.send(msg);
+  });
+
+  terminal.onResize(() => sendResize());
+}
+
+// ── WebSocket connect ─────────────────────────────────────────────────────────
+function connectWs() {
+  if (!authToken || !mvmEndpoint) return;
+  if (ws && ws.readyState < 2) { ws.close(); }
+
+  // Convert https:// to wss://
+  const wsUrl = mvmEndpoint.replace(/^https?:\/\//, 'wss://') + '/';
+
+  const protocols = [
+    'lambda-microvms',
+    `lambda-microvms.authentication.${authToken}`,
+    'lambda-microvms.port.8080',
+    'tty',  // ttyd subprotocol
+  ];
+
+  ws = new WebSocket(wsUrl, protocols);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    clearError();
+    ws.send(JSON.stringify({AuthToken: ''}));
+    setStatus('Connected', 'connected');
+    loadingEl.style.display = 'none';
+    reconnectAttempts = 0;
+    fitAddon.fit();
+    sendResize(); // triggers Claude's TUI to repaint at current terminal size
+    terminal.focus();
+    startPing();
+  };
+
+  ws.onmessage = (event) => {
+    lastPong = Date.now();
+    // ttyd protocol: first byte is message type
+    // 0 = output data, 1 = set window title, 2 = set preferences
+    const data = event.data instanceof ArrayBuffer
+      ? new Uint8Array(event.data)
+      : new TextEncoder().encode(event.data);
+
+    if (data.length === 0) return;
+    // ttyd uses ASCII chars: '0'=48 output, '1'=49 title, '2'=50 prefs
+    const cmd = String.fromCharCode(data[0]);
+    const payload = data.slice(1);
+
+    if (cmd === '0') {
+      terminal.write(payload);
+    } else if (cmd === '1') {
+      document.title = new TextDecoder().decode(payload);
+    }
+    // cmd '2' (preferences) ignored
+  };
+
+  ws.onerror = (e) => {
+    console.error('WS error', e);
+    setStatus('Error', 'error');
+  };
+
+  ws.onclose = (e) => {
+    stopPing();
+    scheduleReconnect();
+  };
+
+}
+
+// ── Keepalive ping ────────────────────────────────────────────────────────────
+// Sends a NUL byte every 15s; if no traffic for 45s we assume the socket is dead.
+function startPing() {
+  stopPing();
+  lastPong = Date.now();
+  pingTimer = setInterval(() => {
+    if (!ws || ws.readyState !== 1) { stopPing(); return; }
+    if (Date.now() - lastPong > 45000) {
+      console.warn('Ping timeout — reconnecting');
+      ws.close();
+      return;
+    }
+    try { ws.send(new Uint8Array(1)); } catch {}
+  }, 15000);
+}
+
+function stopPing() {
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+}
+
+// ── Reconnect scheduling ──────────────────────────────────────────────────────
+function scheduleReconnect() {
+  if (reconnectTimer) return; // already scheduled
+  setStatus('Disconnected', 'error');
+  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+  reconnectAttempts++;
+  if (delay > 1000) setStatus(`Reconnecting in ${Math.round(delay/1000)}s…`, 'error');
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; start(false); }, delay);
+}
+
+// Reset pong timestamp on any incoming message (proves the socket is alive)
+const _origConnectWs = connectWs;
+
+// ── Visibility-change: reconnect immediately when tab comes back ──────────────
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  lastPong = Date.now(); // suppress false ping-timeout on wake
+  if (!ws || ws.readyState > 1) {
+    // Socket is closed or closing — reconnect immediately, skip backoff
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectAttempts = 0;
+    start(false);
+  }
+});
+
+function sendResize() {
+  if (!ws || ws.readyState !== 1) return;
+  const { cols, rows } = terminal;
+  // ttyd resize: binary frame, first byte '1' (0x31) then JSON
+  const json = JSON.stringify({ columns: cols, rows });
+  const encoded = new TextEncoder().encode(json);
+  const msg = new Uint8Array(1 + encoded.length);
+  msg[0] = 0x31; // ASCII '1'
+  msg.set(encoded, 1);
+  ws.send(msg);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+async function start(initTerm = true) {
+  clearError();
+  setStatus('Fetching token…');
+  loadingMsgEl.textContent = 'Connecting to MicroVM…';
+  loadingEl.style.display = 'flex';
+
+  try {
+    await fetchToken();
+  } catch (e) {
+    setStatus('Error', 'error');
+    showError(`Failed to get session token: ${e.message}`);
+    return;
+  }
+
+  if (initTerm) {
+    initTerminal();
+  }
+
+  setStatus('Opening terminal…');
+  connectWs();
+}
+
+function reconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectAttempts = 0;
+  start(false);
+}
+
+// Start is driven by DOMContentLoaded → auto-login or manual login, not here directly
+if (!TOKEN_API_URL) {
+  document.addEventListener('DOMContentLoaded', () =>
+    showError('TOKEN_API_URL not configured. Re-run the deploy script.', false)
+  );
+}
+</script>
+</body>
+</html>

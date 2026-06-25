@@ -1,0 +1,6 @@
+node_modules/
+cdk/cdk.out/
+cdk/.output/
+*.DS_Store
+*.bak
+/tmp/
