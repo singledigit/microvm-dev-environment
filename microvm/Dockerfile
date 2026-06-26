@@ -9,6 +9,7 @@ RUN dnf install -y \
     which \
     shadow-utils \
     procps-ng \
+    sudo \
     amazon-efs-utils \
     python3-pip \
     && dnf clean all \
@@ -21,6 +22,13 @@ RUN curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
 
 # Build tools needed for native node modules (node-pty)
 RUN dnf install -y python3 make gcc gcc-c++ && dnf clean all
+
+# AWS CLI v2 — baked into the image so it survives restarts (system FS is not persisted)
+RUN ARCH=$(uname -m) \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
@@ -38,6 +46,11 @@ RUN chmod +x /entrypoint.sh
 RUN useradd -M -s /bin/bash -u 1000 coder \
     && mkdir -p /home/coder \
     && chown 1000:1000 /home/coder
+
+# Passwordless sudo for coder (browser terminal runs as coder).
+# Note: system changes via sudo do NOT persist — only /home/coder is on S3.
+RUN echo 'coder ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/coder \
+    && chmod 0440 /etc/sudoers.d/coder
 
 # SHELL_INGRESS execs /bin/bash or /bin/sh directly. Guarantee both exist
 # (some base layouts only ship /usr/bin/bash).

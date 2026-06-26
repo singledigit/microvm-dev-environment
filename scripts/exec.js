@@ -23,6 +23,7 @@ const WebSocket = WS_MOD;
 const args = process.argv.slice(2);
 const profile = args[args.indexOf('--profile') + 1] || 'demo';
 const region  = args[args.indexOf('--region')  + 1] || 'us-east-1';
+const asRoot  = args.includes('--root'); // stay as root instead of dropping to coder
 
 function aws(...parts) {
   const cmd = ['aws', ...parts, '--profile', profile, '--region', region, '--output', 'text'];
@@ -111,12 +112,18 @@ async function main() {
       const str = buf.toString('utf8').trimStart();
       if (str.startsWith('{"type":"session_init"')) {
         sessionReady = true;
-        // Set terminal size via stty once the shell is ready
-        const cols = process.stdout.columns || 220;
-        const rows = process.stdout.rows || 50;
+        // SHELL_INGRESS drops us in as root at /. By default switch to the coder
+        // user with a login shell (lands in /home/coder, sources .bashrc). With
+        // --root, stay as root (for system installs etc). `su --pty` allocates a
+        // fresh pseudo-terminal so job control (Ctrl+C/Z, fg/bg) works — without
+        // it the nested shell warns "cannot set terminal process group".
         setTimeout(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(`stty cols ${cols} rows ${rows} && clear\n`);
+          if (ws.readyState !== WebSocket.OPEN) return;
+          if (asRoot) {
+            process.stderr.write('(root shell — system changes do NOT persist across restarts)\n');
+            ws.send(`clear\n`);
+          } else {
+            ws.send(`exec su --pty - coder -c 'clear; exec bash -l'\n`);
           }
         }, 200);
         return;
