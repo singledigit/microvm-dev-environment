@@ -233,7 +233,7 @@ export class IpadClaudeStack extends cdk.Stack {
       environment: {
         MVM_IDENTIFIER_PARAM: '/ipad-claude/mvm-identifier',
         ALLOWED_ORIGINS: '*',
-        IMAGE_ARN: `arn:aws:lambda:${region}:${account}:microvm-image:ipad-claude`,
+        IMAGE_ARN: `arn:aws:lambda:${region}:${account}:microvm-image:ipad-claude-v2`,
         EXECUTION_ROLE_ARN: executionRole.roleArn,
         NETWORK_CONNECTOR_ARN: cdk.Lazy.string({ produce: () => networkConnector.getAtt('Arn').toString() }),
       },
