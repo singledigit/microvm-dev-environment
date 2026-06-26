@@ -245,12 +245,17 @@ if [ "$SKIP_IMAGE" = false ]; then
       --profile "$PROFILE" --region "$REGION" --output json)
     IMAGE_ID=$(echo "$CREATE_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['imageArn'])")
   else
-    log "Image '$IMAGE_NAME' exists ($IMAGE_ID), updating code (capabilities unchanged)..."
+    # update-microvm-image REPLACES the whole version config — capabilities, hooks,
+    # and env vars reset to defaults unless re-passed every time. Always include them.
+    log "Image '$IMAGE_NAME' exists ($IMAGE_ID), updating (re-passing capabilities)..."
     aws lambda-microvms update-microvm-image \
       --image-identifier "$IMAGE_ID" \
       --base-image-arn "arn:aws:lambda:$REGION:aws:microvm-image:al2023-1" \
       --build-role-arn "$BUILD_ROLE" \
       --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
+      --additional-os-capabilities '["ALL"]' \
+      --hooks "$HOOKS_JSON" \
+      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
       --profile "$PROFILE" --region "$REGION" --output json > /dev/null
   fi
 
