@@ -24,11 +24,18 @@ else
   for attempt in 1 2 3 4 5 6; do
     if mount -t s3files "${FS_ID}:/" "$MOUNT_PATH" 2>>/tmp/hooks.log; then
       echo "Mount succeeded on attempt $attempt" | tee -a /tmp/hooks.log
-      # Seed defaults on first use (empty filesystem)
+      # Seed defaults on first use (empty filesystem). Never let a seed error
+      # abort the entrypoint — the terminal must start regardless. NFS-managed
+      # entries like .s3files-lost+found reject chown, so guard every step.
       if [ ! -f "$MOUNT_PATH/.bashrc" ]; then
         echo "New filesystem — seeding defaults..." | tee -a /tmp/hooks.log
-        cp -r "$SKEL/." "$MOUNT_PATH/"
-        chown -R 1000:1000 "$MOUNT_PATH"
+        cp -r "$SKEL/." "$MOUNT_PATH/" 2>>/tmp/hooks.log || echo "seed copy partial" | tee -a /tmp/hooks.log
+        # chown only the files we seeded, skipping NFS-managed lost+found dirs
+        for entry in "$SKEL"/* "$SKEL"/.[!.]*; do
+          [ -e "$entry" ] || continue
+          base=$(basename "$entry")
+          chown -R 1000:1000 "$MOUNT_PATH/$base" 2>>/tmp/hooks.log || true
+        done
         echo "Seed complete" | tee -a /tmp/hooks.log
       fi
       MOUNTED=true

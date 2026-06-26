@@ -9,7 +9,6 @@ RUN dnf install -y \
     which \
     shadow-utils \
     procps-ng \
-    nfs-utils \
     amazon-efs-utils \
     python3-pip \
     && dnf clean all \
@@ -40,6 +39,12 @@ RUN useradd -M -s /bin/bash -u 1000 coder \
     && mkdir -p /home/coder \
     && chown 1000:1000 /home/coder
 
+# SHELL_INGRESS execs /bin/bash or /bin/sh directly. Guarantee both exist
+# (some base layouts only ship /usr/bin/bash).
+RUN [ -e /bin/bash ] || ln -s /usr/bin/bash /bin/bash; \
+    [ -e /bin/sh ]   || ln -s /usr/bin/sh   /bin/sh; \
+    true
+
 # Seed defaults — copied into /home/coder on first S3 mount (empty filesystem)
 RUN mkdir -p /etc/skel-coder/.claude/skills
 COPY bashrc /etc/skel-coder/.bashrc
@@ -67,6 +72,7 @@ RUN echo '{"permissions":{"defaultMode":"bypassPermissions"}}' \
 
 # Bedrock — uses execution role via IMDSv2
 ENV HOME=/home/coder
+ENV S3_FILES_FS_ID=fs-08fd8645a4c0f5b1f
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-4-8

@@ -6,7 +6,7 @@ set -euo pipefail
 PROFILE="demo"
 REGION="us-east-1"
 ACCOUNT="088483494489"
-IMAGE_NAME="ipad-claude"
+IMAGE_NAME="ipad-claude-v2"
 MVM_MEMORY="8192"
 NOTIFICATION_EMAIL="ericdj@amazon.com"
 ROOT_DIR="/Users/ericdj/Sites/ipad-claude"
@@ -14,11 +14,13 @@ ROOT_DIR="/Users/ericdj/Sites/ipad-claude"
 SKIP_CDK=false
 SKIP_IMAGE=false
 SKIP_MVM=false
+RECREATE_IMAGE=false
 for arg in "$@"; do
   case $arg in
-    --skip-cdk)   SKIP_CDK=true ;;
-    --skip-image) SKIP_IMAGE=true ;;
-    --skip-mvm)   SKIP_MVM=true ;;
+    --skip-cdk)       SKIP_CDK=true ;;
+    --skip-image)     SKIP_IMAGE=true ;;
+    --skip-mvm)       SKIP_MVM=true ;;
+    --recreate-image) RECREATE_IMAGE=true ;;
   esac
 done
 
@@ -166,19 +168,23 @@ if [ "$SKIP_IMAGE" = false ]; then
   log "Packaging MicroVM source..."
   ZIP_KEY="ipad-claude-microvm.zip"
   rm -f /tmp/"$ZIP_KEY"
+  # Inject S3_FILES_FS_ID into Dockerfile before zipping
+  sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$ROOT_DIR/microvm/Dockerfile"
+  rm -f "$ROOT_DIR/microvm/Dockerfile.bak"
   (cd "$ROOT_DIR/microvm" && zip -r /tmp/"$ZIP_KEY" . -x "*.DS_Store" > /dev/null)
   aws s3 cp /tmp/"$ZIP_KEY" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" \
     --profile "$PROFILE"
   ok "Source uploaded to s3://$ARTIFACT_BUCKET/$ZIP_KEY"
 
-  RUNTIME_JSON="{
-    \"hooks\": {
+  # GA API (create-microvm-image) takes capabilities, hooks, and env vars as
+  # SEPARATE top-level flags — NOT nested in a --runtime blob.
+  HOOKS_JSON="{
       \"port\": 9000,
-      \"microVmImageHooks\": {
+      \"microvmImageHooks\": {
         \"ready\": \"ENABLED\",
         \"readyTimeoutInSeconds\": 180
       },
-      \"microVmHooks\": {
+      \"microvmHooks\": {
         \"run\":                    \"ENABLED\",
         \"runTimeoutInSeconds\":     10,
         \"resume\":                 \"ENABLED\",
@@ -188,51 +194,74 @@ if [ "$SKIP_IMAGE" = false ]; then
         \"terminate\":              \"ENABLED\",
         \"terminateTimeoutInSeconds\": 10
       }
-    },
-    \"additionalCapabilities\": [\"ALL\"],
-    \"environmentVariables\": {
-      \"S3_FILES_FS_ID\": \"$S3_FILES_FS_ID\"
-    }
-  }"
+    }"
 
   log "Using S3 Files filesystem: $S3_FILES_FS_ID"
   log "Using network connector: $NETWORK_CONNECTOR_ARN"
 
   log "Updating MicroVM image '$IMAGE_NAME' with new version..."
-  IMAGE_ID=$(aws lambda-microvms list-micro-vm-images \
+  IMAGE_ID=$(aws lambda-microvms list-microvm-images \
     --profile "$PROFILE" --region "$REGION" \
     --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" \
     --output text 2>/dev/null || echo "")
 
+  # --additional-os-capabilities only applies at CREATE time; update ignores it.
+  # To change capabilities, the image must be deleted and recreated.
+  if [ "$RECREATE_IMAGE" = true ] && [ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "None" ]; then
+    log "Recreating image — terminating any MVM referencing it, then deleting..."
+    OLD_MVM_ID=$(aws ssm get-parameter --name "/ipad-claude/mvm-identifier" \
+      --profile "$PROFILE" --region "$REGION" \
+      --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+    if [ -n "$OLD_MVM_ID" ] && [ "$OLD_MVM_ID" != "None" ]; then
+      aws lambda-microvms terminate-microvm --microvm-identifier "$OLD_MVM_ID" \
+        --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+      log "Waiting 15s for MVM termination to release the image..."
+      sleep 15
+    fi
+    aws lambda-microvms delete-microvm-image --image-identifier "$IMAGE_ID" \
+      --profile "$PROFILE" --region "$REGION" 2>&1 || true
+    # Poll until the image is gone
+    for i in $(seq 1 30); do
+      STILL=$(aws lambda-microvms list-microvm-images --profile "$PROFILE" --region "$REGION" \
+        --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" --output text 2>/dev/null || echo "None")
+      [ -z "$STILL" ] || [ "$STILL" = "None" ] && break
+      printf "\r  Waiting for image deletion... (%d/30)" "$i"; sleep 5
+    done
+    echo ""
+    IMAGE_ID=""
+    ok "Old image deleted — will create fresh"
+  fi
+
   if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "None" ]; then
-    log "Creating new MicroVM image '$IMAGE_NAME'..."
-    CREATE_OUT=$(aws lambda-microvms create-micro-vm-image \
+    log "Creating new MicroVM image '$IMAGE_NAME' (with --additional-os-capabilities ALL)..."
+    CREATE_OUT=$(aws lambda-microvms create-microvm-image \
       --name "$IMAGE_NAME" \
       --base-image-arn "arn:aws:lambda:$REGION:aws:microvm-image:al2023-1" \
       --build-role-arn "$BUILD_ROLE" \
       --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
-      --runtime "$RUNTIME_JSON" \
+      --additional-os-capabilities '["ALL"]' \
+      --hooks "$HOOKS_JSON" \
+      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
       --profile "$PROFILE" --region "$REGION" --output json)
     IMAGE_ID=$(echo "$CREATE_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['imageArn'])")
   else
-    log "Image '$IMAGE_NAME' exists ($IMAGE_ID), updating..."
-    aws lambda-microvms update-micro-vm-image \
+    log "Image '$IMAGE_NAME' exists ($IMAGE_ID), updating code (capabilities unchanged)..."
+    aws lambda-microvms update-microvm-image \
       --image-identifier "$IMAGE_ID" \
       --base-image-arn "arn:aws:lambda:$REGION:aws:microvm-image:al2023-1" \
       --build-role-arn "$BUILD_ROLE" \
       --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
-      --runtime "$RUNTIME_JSON" \
       --profile "$PROFILE" --region "$REGION" --output json > /dev/null
   fi
 
   ok "Image: $IMAGE_ID — waiting for build (takes ~5-10 min)..."
   for i in $(seq 1 120); do
-    IMAGE_JSON=$(aws lambda-microvms get-micro-vm-image \
+    IMAGE_JSON=$(aws lambda-microvms get-microvm-image \
       --image-identifier "$IMAGE_ID" \
       --profile "$PROFILE" --region "$REGION" --output json 2>/dev/null || echo '{}')
     BUILD_STATE=$(echo "$IMAGE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('state','UNKNOWN'))")
     LATEST_VER=$(echo "$IMAGE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latestActiveImageVersion',''))")
-    if [ "$BUILD_STATE" = "UPDATED" ] && [ -n "$LATEST_VER" ]; then
+    if { [ "$BUILD_STATE" = "UPDATED" ] || [ "$BUILD_STATE" = "CREATED" ]; } && [ -n "$LATEST_VER" ]; then
       ok "Image build complete: $IMAGE_ID (version $LATEST_VER)"
       break
     elif [[ "$BUILD_STATE" == *"FAIL"* ]]; then
@@ -246,7 +275,7 @@ if [ "$SKIP_IMAGE" = false ]; then
   echo ""
 else
   log "Skipping image build (--skip-image)"
-  IMAGE_ID=$(aws lambda-microvms list-micro-vm-images \
+  IMAGE_ID=$(aws lambda-microvms list-microvm-images \
     --profile "$PROFILE" \
     --region "$REGION" \
     --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" \
@@ -263,8 +292,8 @@ if [ "$SKIP_MVM" = false ]; then
     --query 'Parameter.Value' --output text 2>/dev/null || echo "")
   if [ -n "$OLD_MVM_ID" ] && [ "$OLD_MVM_ID" != "None" ]; then
     log "Terminating old MicroVM: $OLD_MVM_ID..."
-    aws lambda-microvms terminate-micro-vm \
-      --micro-vm-identifier "$OLD_MVM_ID" \
+    aws lambda-microvms terminate-microvm \
+      --microvm-identifier "$OLD_MVM_ID" \
       --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
   fi
 
@@ -275,40 +304,29 @@ if [ "$SKIP_MVM" = false ]; then
   fi
 
   log "Launching MicroVM..."
-  # Use --debug to capture raw response which includes microvmId (lowercase v)
-  RAW_RUN=$(aws lambda-microvms run-micro-vm \
+  # GA run-microvm returns clean JSON with microvmId + endpoint — no debug scrape needed.
+  RUN_OUT=$(aws lambda-microvms run-microvm \
     --image-identifier "$IMAGE_ID" \
     --execution-role-arn "$EXECUTION_ROLE" \
     --idle-policy '{"maxIdleDurationSeconds":1800,"suspendedDurationSeconds":600,"autoResumeEnabled":true}' \
     --maximum-duration-in-seconds 28800 \
+    --ingress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
     $EGRESS_FLAG \
     --profile "$PROFILE" \
     --region "$REGION" \
-    --debug --output json 2>&1)
+    --output json 2>&1)
 
-  # Extract from raw response body (microvmId, lowercase v)
-  MVM_ID=$(echo "$RAW_RUN" | grep "Response body:" -A1 | grep "microvmId" | python3 -c "
-import sys, json, re
-for line in sys.stdin:
-    m = re.search(r'b\'(\{.*\})\'', line)
-    if m:
-        d = json.loads(m.group(1))
-        print(d.get('microvmId', ''))
-        break
-")
-  MVM_ENDPOINT=$(echo "$RAW_RUN" | grep "Response body:" -A1 | grep "microvmId" | python3 -c "
-import sys, json, re
-for line in sys.stdin:
-    m = re.search(r'b\'(\{.*\})\'', line)
-    if m:
-        d = json.loads(m.group(1))
-        print('https://' + d.get('endpoint', ''))
-        break
-")
+  MVM_ID=$(echo "$RUN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('microvmId',''))" 2>/dev/null || echo "")
+  MVM_ENDPOINT=$(echo "$RUN_OUT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+ep = d.get('endpoint','')
+print(ep if ep.startswith('https://') else 'https://' + ep)
+" 2>/dev/null || echo "")
 
   if [ -z "$MVM_ID" ]; then
     err "Failed to extract microvmId from run response"
-    echo "$RAW_RUN" | tail -20 >&2
+    echo "$RUN_OUT" | tail -20 >&2
     exit 1
   fi
 
@@ -343,27 +361,13 @@ fi
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 log "Smoke-testing ttyd (port 8080)..."
-SMOKE_RAW=$(aws lambda-microvms create-micro-vm-auth-token \
-  --micro-vm-identifier "$MVM_ID" \
+SMOKE_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
+  --microvm-identifier "$MVM_ID" \
   --expiration-in-minutes 5 \
   --allowed-ports '[{"port":8080}]' \
   --profile "$PROFILE" \
   --region "$REGION" \
-  --debug --output json 2>&1)
-
-SMOKE_TOKEN=$(echo "$SMOKE_RAW" | grep "Response body:" -A1 | grep "authToken" | python3 -c "
-import sys, json, re
-for line in sys.stdin:
-    m = re.search(r'b\'(\{.*\})\'', line)
-    if m:
-        d = json.loads(m.group(1))
-        tok = d.get('authToken', {})
-        if isinstance(tok, dict):
-            print(tok.get('X-aws-proxy-auth', ''))
-        else:
-            print(tok or '')
-        break
-" 2>/dev/null || echo "")
+  --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
 
 if [ -n "$SMOKE_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
   HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
