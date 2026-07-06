@@ -4,8 +4,10 @@
 set -euo pipefail
 
 # Resolve repo root from this script's location (no hardcoded path).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Unset CDPATH first: if it's set in the user's env, `cd` echoes the target
+# dir to stdout, which would corrupt the command substitution below.
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load deployment config. Copy config.env.example → config.env and fill it in.
 if [ ! -f "$ROOT_DIR/config.env" ]; then
@@ -19,7 +21,9 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT in config.env}"
 IMAGE_NAME="${IMAGE_NAME:-ipad-claude-v2}"
 MVM_MEMORY="${MVM_MEMORY:-8192}"
-S3_FILES_FS_ID_CFG="${S3_FILES_FS_ID:?set S3_FILES_FS_ID in config.env}"
+# Optional: reuse an existing S3 Files filesystem. Blank = the CDK stack creates
+# one, and we read its id back from the stack outputs after deploy.
+S3_FILES_FS_ID_CFG="${S3_FILES_FS_ID:-}"
 
 SKIP_CDK=false
 SKIP_IMAGE=false
@@ -109,15 +113,7 @@ else
     | python3 -c "
 import sys, json
 outputs = {o['OutputKey']: o['OutputValue'] for o in json.load(sys.stdin)}
-result = {
-  'IpadClaudeStack': {
-    'ArtifactBucketName': outputs.get('ArtifactBucketName',''),
-    'BuildRoleArn':       outputs.get('BuildRoleArn',''),
-    'ExecutionRoleArn':   outputs.get('ExecutionRoleArn',''),
-    'TokenApiUrl':        outputs.get('TokenApiUrl',''),
-    'FrontendUrl':        outputs.get('FrontendUrl',''),
-  }
-}
+result = {'IpadClaudeStack': outputs}
 print(json.dumps(result))
 " > /tmp/ipad-claude-outputs.json
 fi
@@ -129,8 +125,8 @@ BUILD_ROLE=$(read_output BuildRoleArn)
 EXECUTION_ROLE=$(read_output ExecutionRoleArn)
 TOKEN_API_URL=$(read_output TokenApiUrl)
 FRONTEND_URL=$(read_output FrontendUrl)
-FRONTEND_BUCKET=$(read_output FrontendBucketName 2>/dev/null || echo "ipad-claude-frontend-$ACCOUNT")
-CF_DIST_ID=$(read_output CloudFrontDistributionId 2>/dev/null || echo "")
+FRONTEND_BUCKET=$(read_output FrontendBucketName)
+CF_DIST_ID=$(read_output CloudFrontDistributionId)
 
 ok "Artifact bucket : $ARTIFACT_BUCKET"
 ok "Token API       : $TOKEN_API_URL"

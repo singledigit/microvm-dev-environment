@@ -17,17 +17,11 @@ export class IpadClaudeStack extends cdk.Stack {
     const account = this.account;
     const region = this.region;
 
-    // S3 Files filesystem ID — created out-of-band (see README "Prerequisites"),
-    // passed in via `cdk deploy -c s3FilesFileSystemId=fs-...` (deploy.sh reads
-    // it from config.env).
-    const s3FilesFileSystemId = this.node.tryGetContext('s3FilesFileSystemId')
+    // S3 Files filesystem: this stack CREATES it (see below). To reuse an
+    // existing filesystem instead, pass its id via `-c s3FilesFileSystemId=fs-...`
+    // (deploy.sh forwards S3_FILES_FS_ID from config.env when set).
+    const existingS3FilesId = this.node.tryGetContext('s3FilesFileSystemId')
       || process.env.S3_FILES_FS_ID;
-    if (!s3FilesFileSystemId) {
-      throw new Error(
-        'S3 Files filesystem ID is required. Create the filesystem (see README), '
-        + 'then set S3_FILES_FS_ID in config.env or pass -c s3FilesFileSystemId=fs-...'
-      );
-    }
 
     // ── VPC for S3 Files mount targets ───────────────────────────────────────
     const vpc = new ec2.Vpc(this, 'MicroVmVpc', {
@@ -112,6 +106,45 @@ export class IpadClaudeStack extends cdk.Stack {
         }),
       },
     });
+
+    // ── S3 Files filesystem + mount targets ──────────────────────────────────
+    // S3 Files is built on EFS-style NFS. We create the filesystem (backed by
+    // the workspace bucket, synced via the role above) and a mount target ENI
+    // in each private subnet so the MicroVM can mount it over NFS (port 2049).
+    // Only L1 (Cfn) constructs exist today, so these are raw CfnResources.
+    // If `existingS3FilesId` was supplied, we skip creation and reuse it.
+    let s3FilesFileSystemId: string;
+
+    if (existingS3FilesId) {
+      s3FilesFileSystemId = existingS3FilesId;
+    } else {
+      const fileSystem = new cdk.CfnResource(this, 'S3FilesFileSystem', {
+        type: 'AWS::S3Files::FileSystem',
+        properties: {
+          Bucket: workspaceBucket.bucketArn,
+          RoleArn: s3FilesRole.roleArn,
+          // Acknowledge that this bucket is dedicated to S3 Files (it is —
+          // WorkspaceBucket exists only for the mounted home directories).
+          AcceptBucketWarning: true,
+        },
+      });
+      // The role's bucket + EventBridge permissions must exist before S3 Files
+      // tries to sync / install its change-detection rules.
+      fileSystem.node.addDependency(s3FilesRole);
+      s3FilesFileSystemId = fileSystem.ref;
+
+      // One mount target per private subnet (NFS ENIs), guarded by the NFS SG.
+      vpc.privateSubnets.forEach((subnet, i) => {
+        new cdk.CfnResource(this, `S3FilesMountTarget${i}`, {
+          type: 'AWS::S3Files::MountTarget',
+          properties: {
+            FileSystemId: s3FilesFileSystemId,
+            SubnetId: subnet.subnetId,
+            SecurityGroups: [nfsSg.securityGroupId],
+          },
+        });
+      });
+    }
 
     // ── S3: MicroVM artifact bucket ──────────────────────────────────────────
     const artifactBucket = new s3.Bucket(this, 'ArtifactBucket', {

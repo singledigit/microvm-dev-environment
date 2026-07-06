@@ -59,19 +59,20 @@ portable default).
 
 ## Prerequisites
 
-- An AWS account with **Bedrock model access enabled** for the Claude models you
-  want (Opus 4.8 at minimum).
+- An AWS account with **Bedrock model access enabled** for whichever Claude
+  models you want to use. The default is Opus 4.8, but it runs on any Bedrock
+  Claude model — enable Haiku 4.5 alone if you want the cheapest option, and set
+  it as the default (see `microvm/terminal.js` / the seeded shell config).
 - **AWS Lambda MicroVMs** available in your region (this project uses
   `us-east-1`). MicroVMs are a newer capability — make sure your account/region
   has access.
-- Local tooling: **AWS CLI v2**, **Node.js 20+**, **Docker not required** (the
-  image is built server-side by the MicroVM build service).
-- **An S3 Files filesystem, created ahead of time.** ⚠️ The CDK stack does *not*
-  create this — it only provisions the access role and VPC mount targets, and
-  references the filesystem by ID. Create an S3 Files filesystem in the same
-  region, note its `fs-...` ID, and put it in `config.env` (below). The
-  filesystem's resource policy must allow the `IpadClaudeS3FilesRole` created by
-  the stack to mount it.
+- Local tooling: **AWS CLI v2**, **Node.js 20+**. Docker is *not* required — the
+  MicroVM image is built server-side by the build service.
+
+The CDK stack provisions everything else, including the **S3 Files filesystem**
+and its VPC mount targets (the persistent `/home/coder`). You don't create it by
+hand. (If you'd rather point at an existing filesystem, set `S3_FILES_FS_ID` in
+`config.env` and the stack will reference it instead of creating one.)
 
 ---
 
@@ -86,13 +87,14 @@ this repo.)
 
 ```bash
 cp config.env.example config.env
-$EDITOR config.env       # AWS_ACCOUNT, AWS_PROFILE, S3_FILES_FS_ID, ...
+$EDITOR config.env       # AWS_ACCOUNT, AWS_PROFILE, region, ...
 source config.env        # export the vars for the commands below
 ```
 
-`config.env` is git-ignored, so your account ID and filesystem ID never get
-committed. The commands below assume `$AWS_PROFILE`, `$AWS_REGION`,
-`$AWS_ACCOUNT`, `$S3_FILES_FS_ID`, and `$IMAGE_NAME` are exported from it.
+`config.env` is git-ignored, so your account ID never gets committed. The
+commands below assume `$AWS_PROFILE`, `$AWS_REGION`, `$AWS_ACCOUNT`, and
+`$IMAGE_NAME` are exported from it. `S3_FILES_FS_ID` is optional — leave it blank
+and Stage 1 creates the filesystem; set it to reuse an existing one.
 
 ### Stage 1 — Infrastructure (CDK)
 
@@ -109,18 +111,20 @@ npm install
 CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
   npx cdk bootstrap "aws://$AWS_ACCOUNT/$AWS_REGION" --profile "$AWS_PROFILE"
 
-# Deploy the stack.
+# Deploy the stack. This CREATES the S3 Files filesystem + mount targets (plus
+# everything else). To reuse an existing filesystem instead, add
+# `-c s3FilesFileSystemId=fs-...`.
 CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
   npx cdk deploy IpadClaudeStack \
   --profile "$AWS_PROFILE" \
   --require-approval never \
-  -c s3FilesFileSystemId="$S3_FILES_FS_ID" \
   --outputs-file /tmp/ipad-claude-outputs.json
 cd ..
 ```
 
 The outputs file now holds the bucket names, role ARNs, the token API URL, the
-CloudFront URL, and the network connector ARN that the next two stages need.
+CloudFront URL, the network connector ARN, and the S3 Files filesystem id that
+the next two stages need.
 Read them back with, e.g.:
 
 ```bash
@@ -136,13 +140,14 @@ placeholder; substitute the real token API URL from Stage 1's outputs, upload to
 the frontend bucket, and invalidate the CDN.
 
 ```bash
-TOKEN_API_URL=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+# Helper: pull any stack output by key.
+out() { aws cloudformation describe-stacks --stack-name IpadClaudeStack \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='TokenApiUrl'].OutputValue" --output text)
-FRONTEND_BUCKET="ipad-claude-frontend-$AWS_ACCOUNT"
-CF_DIST_ID=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+
+TOKEN_API_URL=$(out TokenApiUrl)
+FRONTEND_BUCKET=$(out FrontendBucketName)
+CF_DIST_ID=$(out CloudFrontDistributionId)
 
 # Inject the token API URL, then upload.
 sed "s|__TOKEN_API_URL__|$TOKEN_API_URL|g" frontend/index.html > /tmp/index.html
@@ -159,16 +164,12 @@ Two steps: build the image (zip the `microvm/` dir → upload to the artifact
 bucket → create/update the MicroVM image), then run a MicroVM from it.
 
 ```bash
-BUILD_ROLE=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='BuildRoleArn'].OutputValue" --output text)
-EXECUTION_ROLE=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text)
-ARTIFACT_BUCKET="ipad-claude-artifacts-$AWS_ACCOUNT"
-NETWORK_CONNECTOR_ARN=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='NetworkConnectorArn'].OutputValue" --output text)
+# (uses the out() helper from Stage 2)
+BUILD_ROLE=$(out BuildRoleArn)
+EXECUTION_ROLE=$(out ExecutionRoleArn)
+ARTIFACT_BUCKET=$(out ArtifactBucketName)
+NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
+S3_FILES_FS_ID=$(out S3FilesFileSystemId)   # the stack created this in Stage 1
 
 # 3a. Package the image source (substitute the FS ID placeholder first) and upload.
 sed "s|__S3_FILES_FS_ID__|$S3_FILES_FS_ID|" microvm/Dockerfile > /tmp/Dockerfile.built

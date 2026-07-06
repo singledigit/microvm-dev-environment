@@ -130,7 +130,7 @@ EOF
 
 # Bedrock — uses execution role via IMDSv2
 ENV HOME=/home/coder
-ENV S3_FILES_FS_ID=__S3_FILES_FS_ID__
+ENV S3_FILES_FS_ID=fs-08fd8645a4c0f5b1f
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 # Default model: Opus (Fable requires US data residency; users may be outside US).
