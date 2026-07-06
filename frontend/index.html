@@ -96,7 +96,7 @@
     #header h1 {
       font-size: 15px;
       font-weight: 600;
-      color: #e94560;
+      color: #f0f6fc;
       letter-spacing: 0.5px;
     }
     #status {
@@ -108,6 +108,7 @@
     }
     #status.connected { background: #1a4a1a; color: #4caf50; }
     #status.error { background: #4a1a1a; color: #f44336; }
+    #status.warming { background: #3d2e0f; color: #d29922; }
     #terminal-container {
       flex: 1;
       overflow: hidden;
@@ -277,6 +278,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // ── State ────────────────────────────────────────────────────────────────────
 let terminal, fitAddon, ws;
 let authToken = null, mvmEndpoint = null;
+let vmState = 'running'; // 'running' | 'starting' | 'resuming' — from the token API
 let tokenExpiresAt = 0;
 let refreshTimer = null;
 let reconnectAttempts = 0;
@@ -313,6 +315,7 @@ async function fetchToken() {
   const data = await resp.json();
   authToken = data.authToken;
   mvmEndpoint = data.endpoint;
+  vmState = data.vmState || 'running';
   tokenExpiresAt = Date.now() + data.expiresInSeconds * 1000;
 
   // Schedule refresh 5 min before expiry
@@ -410,10 +413,16 @@ function connectWs() {
 
   ws.onopen = () => {
     clearError();
+    // The server replays its scrollback buffer on every (re)connect — reset the
+    // terminal first so the replay lands on a clean screen instead of stacking
+    // below the previous session's content.
+    terminal.reset();
     ws.send(JSON.stringify({AuthToken: ''}));
-    setStatus('Connected', 'connected');
-    loadingEl.style.display = 'none';
-    reconnectAttempts = 0;
+    // Don't declare "Connected" yet: while the VM boots, the ingress proxy can
+    // accept the WS handshake before the terminal server is actually serving,
+    // then drop it. Treat the connection as live only when data arrives
+    // (onmessage) — until then keep the calm warming status.
+    if (!isWarmingUp()) setStatus('Connected', 'connected');
     fitAddon.fit();
     sendResize(); // triggers Claude's TUI to repaint at current terminal size
     terminal.focus();
@@ -422,6 +431,13 @@ function connectWs() {
 
   ws.onmessage = (event) => {
     lastPong = Date.now();
+    // First data from the terminal server = the session is genuinely live.
+    if (vmState !== 'running' || reconnectAttempts > 0) {
+      vmState = 'running';
+      reconnectAttempts = 0;
+      setStatus('Connected', 'connected');
+    }
+    loadingEl.style.display = 'none';
     // ttyd protocol: first byte is message type
     // 0 = output data, 1 = set window title, 2 = set preferences
     const data = event.data instanceof ArrayBuffer
@@ -443,7 +459,9 @@ function connectWs() {
 
   ws.onerror = (e) => {
     console.error('WS error', e);
-    setStatus('Error', 'error');
+    // Failed attempts while the VM boots are expected — stay calm, onclose
+    // will schedule the next quiet retry.
+    if (!isWarmingUp()) setStatus('Error', 'error');
   };
 
   ws.onclose = (e) => {
@@ -474,12 +492,28 @@ function stopPing() {
 }
 
 // ── Reconnect scheduling ──────────────────────────────────────────────────────
+// While the VM is warming up (fresh launch or resume from suspend), connection
+// attempts are expected to fail for a while — keep the status calm and retry
+// quietly. Red is reserved for unexpected drops of a previously-live session.
+const WARMUP_STATUS = { starting: 'Starting VM…', resuming: 'Resuming VM…' };
+
+function isWarmingUp() {
+  return vmState === 'starting' || vmState === 'resuming';
+}
+
 function scheduleReconnect() {
   if (reconnectTimer) return; // already scheduled
-  setStatus('Disconnected', 'error');
-  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+  let delay;
+  if (isWarmingUp()) {
+    setStatus(WARMUP_STATUS[vmState], 'warming');
+    loadingMsgEl.textContent = WARMUP_STATUS[vmState];
+    delay = 3000; // steady poll while booting — no alarming backoff countdown
+  } else {
+    setStatus('Disconnected', 'error');
+    delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    if (delay > 1000) setStatus(`Reconnecting in ${Math.round(delay/1000)}s…`, 'error');
+  }
   reconnectAttempts++;
-  if (delay > 1000) setStatus(`Reconnecting in ${Math.round(delay/1000)}s…`, 'error');
   reconnectTimer = setTimeout(() => { reconnectTimer = null; start(false); }, delay);
 }
 
@@ -513,8 +547,12 @@ function sendResize() {
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function start(initTerm = true) {
   clearError();
-  setStatus('Fetching token…');
-  loadingMsgEl.textContent = 'Connecting to MicroVM…';
+  if (isWarmingUp()) {
+    setStatus(WARMUP_STATUS[vmState], 'warming');
+  } else {
+    setStatus('Connecting…');
+    loadingMsgEl.textContent = 'Connecting to MicroVM…';
+  }
   loadingEl.style.display = 'flex';
 
   try {
@@ -525,11 +563,16 @@ async function start(initTerm = true) {
     return;
   }
 
+  // Token fetch may have just triggered a launch/resume — reflect it right away
+  if (isWarmingUp()) {
+    setStatus(WARMUP_STATUS[vmState], 'warming');
+    loadingMsgEl.textContent = WARMUP_STATUS[vmState];
+  }
+
   if (initTerm) {
     initTerminal();
   }
 
-  setStatus('Opening terminal…');
   connectWs();
 }
 

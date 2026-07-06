@@ -166,6 +166,9 @@ exports.handler = async (event) => {
   try {
     let mvmId = '';
     let mvmEndpoint = '';
+    // Reported to the frontend so it can show "Starting VM…" / "Resuming VM…"
+    // instead of alarming reconnect errors while the VM warms up.
+    let vmState = 'running';
 
     try {
       [mvmId, mvmEndpoint] = await Promise.all([
@@ -184,6 +187,7 @@ exports.handler = async (event) => {
         // Happy path
       } else if (state === 'SUSPENDED') {
         console.log('Resuming suspended MVM…');
+        vmState = 'resuming';
         await resumeMvm(mvmId);
         // Give it a moment to start accepting connections
         await new Promise(r => setTimeout(r, 3000));
@@ -196,6 +200,7 @@ exports.handler = async (event) => {
 
     if (!mvmId) {
       console.log('Launching new MicroVM…');
+      vmState = 'starting';
       const result = await runNewMvm();
       mvmId = result.mvmId;
       mvmEndpoint = result.endpoint;
@@ -215,7 +220,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
-      body: JSON.stringify({ authToken, endpoint, expiresInSeconds: 55 * 60 }),
+      body: JSON.stringify({ authToken, endpoint, expiresInSeconds: 55 * 60, vmState }),
     };
   } catch (err) {
     console.error('Token vend error:', err.message);

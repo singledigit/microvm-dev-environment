@@ -22,7 +22,12 @@ const SHELL_ENV = {
   SHELL: '/usr/bin/bash',
   CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_REGION: 'us-east-1',
-  ANTHROPIC_MODEL: 'us.anthropic.claude-opus-4-8',
+  // Default model: Fable. /model picker aliases map to the latest of each tier.
+  ANTHROPIC_MODEL: 'us.anthropic.claude-fable-5',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'us.anthropic.claude-opus-4-8',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'us.anthropic.claude-sonnet-5',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  ANTHROPIC_SMALL_FAST_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   DISABLE_AUTOUPDATER: '1',
   DO_NOT_TRACK: '1',
@@ -228,6 +233,16 @@ wss.on('connection', (ws) => {
     if (!isBinary) return;
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (buf.length === 0) return;
+
+    // Keepalive: the client sends a single NUL byte every 15s. Echo it back so
+    // the client's liveness timer sees traffic even when the PTY is idle —
+    // without this, an idle prompt looks like a dead socket and the client
+    // closes/reopens the connection every 45s.
+    if (buf.length === 1 && buf[0] === 0x00) {
+      ws.send(buf);
+      return;
+    }
+
     const cmd = String.fromCharCode(buf[0]);
     const payload = buf.slice(1);
 

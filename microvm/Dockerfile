@@ -83,12 +83,29 @@ EOF
 RUN echo '{"permissions":{"defaultMode":"bypassPermissions"}}' \
     > /etc/skel-coder/.claude/settings.json
 
+# WebFetch/WebSearch domain verification (claude.ai) is unreachable from the MVM
+# network, so those tools always fail — steer Claude to curl via Bash instead.
+RUN cat > /etc/skel-coder/.claude/CLAUDE.md <<'EOF'
+# Sandbox environment notes
+
+- The WebFetch and WebSearch tools do not work in this sandbox: their domain-safety
+  verification endpoint (claude.ai) is blocked from this network, so every fetch is
+  rejected as "unverifiable" even though the target site is reachable.
+- Outbound network access from Bash is fully open. To fetch web content, use curl
+  instead, e.g.: curl -s "https://example.com"  or  curl -s "wttr.in/London?format=3"
+EOF
+
 # Bedrock — uses execution role via IMDSv2
 ENV HOME=/home/coder
 ENV S3_FILES_FS_ID=fs-08fd8645a4c0f5b1f
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
-ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-4-8
+# Default model: Fable. /model picker aliases map to the latest of each tier.
+ENV ANTHROPIC_MODEL=us.anthropic.claude-fable-5
+ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-4-8
+ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
+ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
+ENV ANTHROPIC_SMALL_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENV DISABLE_AUTOUPDATER=1
 ENV DO_NOT_TRACK=1

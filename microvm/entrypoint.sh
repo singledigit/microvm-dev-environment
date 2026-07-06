@@ -1,9 +1,28 @@
 #!/bin/bash
 set -e
 
-# Pull key binaries into page cache for faster first access after snapshot resume
-cat /usr/bin/node > /dev/null 2>&1 || true
-cat $(which claude 2>/dev/null) > /dev/null 2>&1 || true
+# Move the Claude CLI bundle into tmpfs so it lands in the MEMORY snapshot,
+# which is eagerly restored on run/resume. Plain page-cache warming does NOT
+# survive snapshot capture (the platform drops clean file-backed pages), so on
+# a fresh VM the first `claude` demand-pages ~240MB of disk from snapshot
+# storage at ~3MB/s — a 60-90s stall. tmpfs pages are anonymous memory and
+# must be preserved, so this makes first start as fast as every later start.
+# This runs once at image build; the snapshot captures the tmpfs contents.
+CLI_DIR=/usr/lib/node_modules/@anthropic-ai/claude-code
+if [ -d "$CLI_DIR" ] && ! mountpoint -q "$CLI_DIR" 2>/dev/null; then
+  if mv "$CLI_DIR" "${CLI_DIR}.disk" \
+     && mkdir "$CLI_DIR" \
+     && mount -t tmpfs -o size=512m,mode=0755 tmpfs "$CLI_DIR" \
+     && cp -a "${CLI_DIR}.disk/." "$CLI_DIR/"; then
+    echo "claude bundle relocated to tmpfs" >> /tmp/hooks.log
+  else
+    # Roll back so the CLI still works from disk
+    umount "$CLI_DIR" 2>/dev/null || true
+    rmdir "$CLI_DIR" 2>/dev/null || true
+    [ -d "${CLI_DIR}.disk" ] && mv "${CLI_DIR}.disk" "$CLI_DIR"
+    echo "tmpfs relocation failed — claude stays on disk" >> /tmp/hooks.log
+  fi
+fi
 
 # Log hooks server output so failures are visible
 node /opt/app/hooks.js > /tmp/hooks.log 2>&1 &
