@@ -11,8 +11,10 @@ const cmd = process.argv[2];
 const timeoutSec = parseInt(process.argv[3] || '120', 10);
 if (!cmd) { console.error('Usage: run-remote.js <command> [timeout-sec]'); process.exit(1); }
 
+const PROFILE = process.env.AWS_PROFILE || 'default';
+const REGION = process.env.AWS_REGION || 'us-east-1';
 function aws(...parts) {
-  const r = spawnSync('aws', [...parts, '--profile', 'demo', '--region', 'us-east-1', '--output', 'text'], { encoding: 'utf8' });
+  const r = spawnSync('aws', [...parts, '--profile', PROFILE, '--region', REGION, '--output', 'text'], { encoding: 'utf8' });
   if (r.status !== 0) throw new Error(r.stderr?.trim());
   return r.stdout.trim();
 }

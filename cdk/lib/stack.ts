@@ -17,6 +17,18 @@ export class IpadClaudeStack extends cdk.Stack {
     const account = this.account;
     const region = this.region;
 
+    // S3 Files filesystem ID — created out-of-band (see README "Prerequisites"),
+    // passed in via `cdk deploy -c s3FilesFileSystemId=fs-...` (deploy.sh reads
+    // it from config.env).
+    const s3FilesFileSystemId = this.node.tryGetContext('s3FilesFileSystemId')
+      || process.env.S3_FILES_FS_ID;
+    if (!s3FilesFileSystemId) {
+      throw new Error(
+        'S3 Files filesystem ID is required. Create the filesystem (see README), '
+        + 'then set S3_FILES_FS_ID in config.env or pass -c s3FilesFileSystemId=fs-...'
+      );
+    }
+
     // ── VPC for S3 Files mount targets ───────────────────────────────────────
     const vpc = new ec2.Vpc(this, 'MicroVmVpc', {
       vpcName: 'ipad-claude-vpc',
@@ -139,7 +151,11 @@ export class IpadClaudeStack extends cdk.Stack {
       },
     });
 
-    // ── IAM: MicroVM execution role (full admin + Bedrock) ────────────────────
+    // ── IAM: MicroVM execution role (serverless-developer scope + Bedrock) ────
+    // PowerUserAccess = full access to AWS services, WITHOUT IAM/Organizations
+    // management. This is the credential the sandbox operates with — anything
+    // Claude runs in the terminal can use it. Widen or narrow to taste; see the
+    // SECURITY section in the README before deploying anywhere shared.
     const executionRole = new iam.Role(this, 'MicroVmExecutionRole', {
       roleName: 'MicroVmExecutionRole',
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com', {
@@ -148,7 +164,7 @@ export class IpadClaudeStack extends cdk.Stack {
         },
       }),
       managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('AdministratorAccess'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('PowerUserAccess'),
       ],
       inlinePolicies: {
         BedrockInvoke: new iam.PolicyDocument({
@@ -419,7 +435,7 @@ export class IpadClaudeStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'S3FilesFileSystemId', {
-      value: 'fs-08fd8645a4c0f5b1f',
+      value: s3FilesFileSystemId,
       exportName: 'IpadClaudeS3FilesFileSystemId',
     });
   }

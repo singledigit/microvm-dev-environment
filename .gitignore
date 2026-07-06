@@ -4,3 +4,9 @@ cdk/.output/
 *.DS_Store
 *.bak
 /tmp/
+
+# Local deployment config — never commit (your account ID, FS ID, profile, etc.)
+config.env
+
+# CDK context caches account-specific data (AZ lookups keyed by account ID)
+cdk/cdk.context.json

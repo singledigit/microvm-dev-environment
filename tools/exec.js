@@ -21,8 +21,8 @@ const WebSocket = WS_MOD;
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
-const profile = args[args.indexOf('--profile') + 1] || 'demo';
-const region  = args[args.indexOf('--region')  + 1] || 'us-east-1';
+const profile = args[args.indexOf('--profile') + 1] || process.env.AWS_PROFILE || 'default';
+const region  = args[args.indexOf('--region')  + 1] || process.env.AWS_REGION  || 'us-east-1';
 const asRoot  = args.includes('--root'); // stay as root instead of dropping to coder
 
 function aws(...parts) {

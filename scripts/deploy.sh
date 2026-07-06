@@ -1,15 +1,25 @@
 #!/bin/bash
 # End-to-end deploy for ipad-claude
-# Usage: ./scripts/deploy.sh [--skip-cdk] [--skip-image] [--skip-mvm]
+# Usage: ./scripts/deploy.sh [--skip-cdk] [--skip-image] [--skip-mvm] [--recreate-image]
 set -euo pipefail
 
-PROFILE="demo"
-REGION="us-east-1"
-ACCOUNT="088483494489"
-IMAGE_NAME="ipad-claude-v2"
-MVM_MEMORY="8192"
-NOTIFICATION_EMAIL="ericdj@amazon.com"
-ROOT_DIR="/Users/ericdj/Sites/ipad-claude"
+# Resolve repo root from this script's location (no hardcoded path).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load deployment config. Copy config.env.example → config.env and fill it in.
+if [ ! -f "$ROOT_DIR/config.env" ]; then
+  echo "config.env not found. Copy config.env.example to config.env and set your values." >&2
+  exit 1
+fi
+set -a; . "$ROOT_DIR/config.env"; set +a
+
+PROFILE="${AWS_PROFILE:-default}"
+REGION="${AWS_REGION:-us-east-1}"
+ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT in config.env}"
+IMAGE_NAME="${IMAGE_NAME:-ipad-claude-v2}"
+MVM_MEMORY="${MVM_MEMORY:-8192}"
+S3_FILES_FS_ID_CFG="${S3_FILES_FS_ID:?set S3_FILES_FS_ID in config.env}"
 
 SKIP_CDK=false
 SKIP_IMAGE=false
@@ -80,9 +90,11 @@ if [ "$SKIP_CDK" = false ]; then
     2>&1 | tail -3)
 
   log "Deploying CDK stack..."
-  (cd "$ROOT_DIR/cdk" && npx cdk deploy IpadClaudeStack \
+  (cd "$ROOT_DIR/cdk" && CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION" \
+    npx cdk deploy IpadClaudeStack \
     --profile "$PROFILE" \
     --require-approval never \
+    -c s3FilesFileSystemId="$S3_FILES_FS_ID_CFG" \
     --outputs-file /tmp/ipad-claude-outputs.json \
     2>&1)
   ok "CDK stack deployed"
@@ -129,7 +141,7 @@ S3_FILES_FS_ID=$(aws cloudformation describe-stacks \
   --stack-name IpadClaudeStack \
   --profile "$PROFILE" --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='S3FilesFileSystemId'].OutputValue" \
-  --output text 2>/dev/null || echo "fs-08fd8645a4c0f5b1f")
+  --output text 2>/dev/null || echo "$S3_FILES_FS_ID_CFG")
 
 NETWORK_CONNECTOR_ARN=$(aws cloudformation describe-stacks \
   --stack-name IpadClaudeStack \
@@ -399,7 +411,7 @@ echo "  MicroVM ID   : $MVM_ID"
 echo "  MVM State    : $MVM_STATE"
 echo ""
 echo "  Login:"
-echo "    Email    : $NOTIFICATION_EMAIL"
+echo "    Email    : ${LOGIN_EMAIL:-any email (not validated)}"
 echo "    Password : $PORTAL_PASSWORD"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
