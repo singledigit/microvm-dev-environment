@@ -22,8 +22,8 @@ const SHELL_ENV = {
   SHELL: '/usr/bin/bash',
   CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_REGION: 'us-east-1',
-  // Default model: Fable. /model picker aliases map to the latest of each tier.
-  ANTHROPIC_MODEL: 'us.anthropic.claude-fable-5',
+  // Default model: Opus. Fable available via /model us.anthropic.claude-fable-5.
+  ANTHROPIC_MODEL: 'us.anthropic.claude-opus-4-8',
   ANTHROPIC_DEFAULT_OPUS_MODEL: 'us.anthropic.claude-opus-4-8',
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'us.anthropic.claude-sonnet-5',
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',

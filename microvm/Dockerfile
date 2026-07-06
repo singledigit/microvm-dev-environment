@@ -100,8 +100,9 @@ ENV HOME=/home/coder
 ENV S3_FILES_FS_ID=fs-08fd8645a4c0f5b1f
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
-# Default model: Fable. /model picker aliases map to the latest of each tier.
-ENV ANTHROPIC_MODEL=us.anthropic.claude-fable-5
+# Default model: Opus (Fable requires US data residency; users may be outside US).
+# Fable available via: /model us.anthropic.claude-fable-5
+ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-4-8
 ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-4-8
 ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
 ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
