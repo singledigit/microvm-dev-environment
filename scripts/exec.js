@@ -123,7 +123,7 @@ async function main() {
             process.stderr.write('(root shell — system changes do NOT persist across restarts)\n');
             ws.send(`clear\n`);
           } else {
-            ws.send(`exec su --pty - coder -c 'clear; exec bash -l'\n`);
+            ws.send(`exec su --pty - coder -c 'clear; exec zsh -l'\n`);
           }
         }, 200);
         return;

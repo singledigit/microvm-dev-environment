@@ -10,13 +10,14 @@ RUN dnf install -y \
     shadow-utils \
     procps-ng \
     sudo \
+    zsh \
     amazon-efs-utils \
     python3-pip \
     && dnf clean all \
     && pip3 install botocore
 
-# Node.js 20
-RUN curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
+# Node.js (latest LTS via NodeSource)
+RUN curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - \
     && dnf install -y nodejs \
     && dnf clean all
 
@@ -30,6 +31,35 @@ RUN ARCH=$(uname -m) \
     && /tmp/aws/install \
     && rm -rf /tmp/awscliv2.zip /tmp/aws
 
+# Python 3.13 as the system interpreter. AL2023 ships 3.9, but the AWS agent
+# toolkit's secret-safety hook (and other tooling) needs >=3.10. uv picks its
+# own compatible Python for the MCP proxy at runtime; this is just a modern
+# system python3.
+RUN dnf install -y python3.13 python3.13-pip \
+    && dnf clean all \
+    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 90
+
+# uv/uvx on the SYSTEM filesystem (/opt), with all uv state pointed at /opt too.
+# WHY: the AWS agent toolkit plugin launches its MCP proxy via `uvx` (stock
+# config). uv relies on hardlinks for cache locking and package materialization,
+# and /home/coder is an NFS mount that rejects hardlinks (EMLINK) — so uvx fails
+# there no matter the link mode. /opt is a normal FS (hardlinks OK) and is baked
+# into the image snapshot, so relocating uv's cache/tool/python dirs to /opt lets
+# the plugin run EXACTLY as shipped — no patched .mcp.json, no re-patch hook.
+# The proxy package is pre-warmed into the cache so the first `uvx` is instant
+# and works offline.
+ENV UV_INSTALL_DIR=/opt/uv/bin \
+    UV_CACHE_DIR=/opt/uv/cache \
+    UV_TOOL_DIR=/opt/uv/tool \
+    UV_TOOL_BIN_DIR=/opt/uv/toolbin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/python \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/opt/uv/bin sh \
+    && ln -sf /opt/uv/bin/uv /usr/local/bin/uv \
+    && ln -sf /opt/uv/bin/uvx /usr/local/bin/uvx \
+    && /opt/uv/bin/uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 \
+    && chown -R 1000:1000 /opt/uv
+
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -42,8 +72,9 @@ COPY terminal.js /opt/app/terminal.js
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it
-RUN useradd -M -s /bin/bash -u 1000 coder \
+# App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
+# zsh is the login shell.
+RUN useradd -M -s /bin/zsh -u 1000 coder \
     && mkdir -p /home/coder \
     && chown 1000:1000 /home/coder
 
@@ -52,14 +83,16 @@ RUN useradd -M -s /bin/bash -u 1000 coder \
 RUN echo 'coder ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/coder \
     && chmod 0440 /etc/sudoers.d/coder
 
-# SHELL_INGRESS execs /bin/bash or /bin/sh directly. Guarantee both exist
-# (some base layouts only ship /usr/bin/bash).
+# SHELL_INGRESS execs /bin/bash, /bin/zsh, or /bin/sh directly. Guarantee all
+# exist (some base layouts only ship the /usr/bin variants).
 RUN [ -e /bin/bash ] || ln -s /usr/bin/bash /bin/bash; \
+    [ -e /bin/zsh ]  || ln -s /usr/bin/zsh  /bin/zsh; \
     [ -e /bin/sh ]   || ln -s /usr/bin/sh   /bin/sh; \
     true
 
 # Seed defaults — copied into /home/coder on first S3 mount (empty filesystem)
 RUN mkdir -p /etc/skel-coder/.claude/skills
+COPY zshrc /etc/skel-coder/.zshrc
 COPY bashrc /etc/skel-coder/.bashrc
 COPY skills/ /etc/skel-coder/.claude/skills/
 

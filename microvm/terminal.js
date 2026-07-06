@@ -11,7 +11,7 @@ try {
 }
 
 const PORT = 8080;
-const SHELL = '/usr/bin/bash';
+const SHELL = '/usr/bin/zsh';
 const SHELL_ENV = {
   HOME: '/home/coder',
   PATH: '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
@@ -19,7 +19,7 @@ const SHELL_ENV = {
   LANG: 'en_US.UTF-8',
   USER: 'coder',
   LOGNAME: 'coder',
-  SHELL: '/usr/bin/bash',
+  SHELL: '/usr/bin/zsh',
   CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_REGION: 'us-east-1',
   // Default model: Opus. Fable available via /model us.anthropic.claude-fable-5.
@@ -28,6 +28,12 @@ const SHELL_ENV = {
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'us.anthropic.claude-sonnet-5',
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
   ANTHROPIC_SMALL_FAST_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  // uv/uvx state on the hardlink-capable system FS (NFS home rejects hardlinks),
+  // so the AWS toolkit's uvx-launched MCP proxy runs from the warmed /opt cache.
+  UV_CACHE_DIR: '/opt/uv/cache',
+  UV_PYTHON_INSTALL_DIR: '/opt/uv/python',
+  UV_TOOL_DIR: '/opt/uv/tool',
+  UV_TOOL_BIN_DIR: '/opt/uv/toolbin',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   DISABLE_AUTOUPDATER: '1',
   DO_NOT_TRACK: '1',

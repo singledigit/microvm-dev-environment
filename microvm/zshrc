@@ -15,7 +15,15 @@ export UV_CACHE_DIR=/opt/uv/cache
 export UV_PYTHON_INSTALL_DIR=/opt/uv/python
 export UV_TOOL_DIR=/opt/uv/tool
 export UV_TOOL_BIN_DIR=/opt/uv/toolbin
-export PS1='\[\033[1;32m\]coder@claude\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ '
+
+# Prompt: green coder@claude : blue cwd $
+PROMPT='%F{green}coder@claude%f:%F{blue}%~%f$ '
+
+# History on the persistent home
+export HISTFILE=/home/coder/.zsh_history
+export HISTSIZE=10000
+export SAVEHIST=10000
+setopt SHARE_HISTORY INC_APPEND_HISTORY
 
 cd /home/coder
 echo ""
