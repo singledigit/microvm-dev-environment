@@ -75,46 +75,182 @@ portable default).
 
 ---
 
-## Setup
+## Deploy — the three stages
 
-1. **Configure.** Copy the example and fill in your values:
+The system has three deployable layers, and it's worth understanding each one
+before reaching for the script. Configure first, then walk the stages. (There's
+a one-command script at the end — but do it by hand once; that's the point of
+this repo.)
 
-   ```bash
-   cp config.env.example config.env
-   $EDITOR config.env      # set AWS_ACCOUNT, AWS_PROFILE, S3_FILES_FS_ID, ...
-   ```
+**Configure.** Copy the example and fill in your values:
 
-   `config.env` is git-ignored — your account ID and filesystem ID never get
-   committed.
+```bash
+cp config.env.example config.env
+$EDITOR config.env       # AWS_ACCOUNT, AWS_PROFILE, S3_FILES_FS_ID, ...
+source config.env        # export the vars for the commands below
+```
 
-2. **Install script deps** (for the local shell helpers):
+`config.env` is git-ignored, so your account ID and filesystem ID never get
+committed. The commands below assume `$AWS_PROFILE`, `$AWS_REGION`,
+`$AWS_ACCOUNT`, `$S3_FILES_FS_ID`, and `$IMAGE_NAME` are exported from it.
 
-   ```bash
-   cd scripts && npm install && cd ..
-   ```
+### Stage 1 — Infrastructure (CDK)
 
-3. **Deploy** — one command does everything (CDK → frontend → MicroVM image →
-   launch → smoke test):
+Provisions the VPC, security group, the three S3 buckets, all IAM roles, the
+token-vending Lambda + API Gateway, CloudFront, and the VPC-egress network
+connector. The S3 Files filesystem ID is passed in as context (the stack
+references it; it does not create it — see Prerequisites).
 
-   ```bash
-   ./scripts/deploy.sh
-   ```
+```bash
+cd cdk
+npm install
 
-   First run takes ~10 minutes (most of it building the MicroVM image). It
-   prints the CloudFront URL and an auto-generated login password (also stored
-   in SSM at `/ipad-claude/password`).
+# One-time per account/region: create the CDK toolkit stack.
+CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
+  npx cdk bootstrap "aws://$AWS_ACCOUNT/$AWS_REGION" --profile "$AWS_PROFILE"
 
-4. **Open the CloudFront URL**, log in with any email and that password.
+# Deploy the stack.
+CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
+  npx cdk deploy IpadClaudeStack \
+  --profile "$AWS_PROFILE" \
+  --require-approval never \
+  -c s3FilesFileSystemId="$S3_FILES_FS_ID" \
+  --outputs-file /tmp/ipad-claude-outputs.json
+cd ..
+```
 
-### Deploy flags
+The outputs file now holds the bucket names, role ARNs, the token API URL, the
+CloudFront URL, and the network connector ARN that the next two stages need.
+Read them back with, e.g.:
+
+```bash
+aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs" --output table
+```
+
+### Stage 2 — Frontend (S3 + CloudFront)
+
+The frontend is one static `index.html`. It ships with a `__TOKEN_API_URL__`
+placeholder; substitute the real token API URL from Stage 1's outputs, upload to
+the frontend bucket, and invalidate the CDN.
+
+```bash
+TOKEN_API_URL=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='TokenApiUrl'].OutputValue" --output text)
+FRONTEND_BUCKET="ipad-claude-frontend-$AWS_ACCOUNT"
+CF_DIST_ID=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)
+
+# Inject the token API URL, then upload.
+sed "s|__TOKEN_API_URL__|$TOKEN_API_URL|g" frontend/index.html > /tmp/index.html
+aws s3 cp /tmp/index.html "s3://$FRONTEND_BUCKET/index.html" --profile "$AWS_PROFILE"
+
+# Bust the CloudFront cache so the new page is served immediately.
+aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" \
+  --paths "/*" --profile "$AWS_PROFILE"
+```
+
+### Stage 3 — MicroVM image + launch
+
+Two steps: build the image (zip the `microvm/` dir → upload to the artifact
+bucket → create/update the MicroVM image), then run a MicroVM from it.
+
+```bash
+BUILD_ROLE=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='BuildRoleArn'].OutputValue" --output text)
+EXECUTION_ROLE=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text)
+ARTIFACT_BUCKET="ipad-claude-artifacts-$AWS_ACCOUNT"
+NETWORK_CONNECTOR_ARN=$(aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='NetworkConnectorArn'].OutputValue" --output text)
+
+# 3a. Package the image source (substitute the FS ID placeholder first) and upload.
+sed "s|__S3_FILES_FS_ID__|$S3_FILES_FS_ID|" microvm/Dockerfile > /tmp/Dockerfile.built
+cp /tmp/Dockerfile.built microvm/Dockerfile
+(cd microvm && zip -r /tmp/ipad-claude-microvm.zip . -x "*.DS_Store")
+aws s3 cp /tmp/ipad-claude-microvm.zip "s3://$ARTIFACT_BUCKET/ipad-claude-microvm.zip" \
+  --profile "$AWS_PROFILE"
+
+# 3b. Create the MicroVM image. --additional-os-capabilities '["ALL"]' grants
+#     CAP_SYS_ADMIN (needed to mount S3 Files) and ONLY applies at create time.
+#     Hooks let the app mount/unmount around lifecycle transitions.
+aws lambda-microvms create-microvm-image \
+  --name "$IMAGE_NAME" \
+  --base-image-arn "arn:aws:lambda:$AWS_REGION:aws:microvm-image:al2023-1" \
+  --build-role-arn "$BUILD_ROLE" \
+  --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/ipad-claude-microvm.zip\"}" \
+  --additional-os-capabilities '["ALL"]' \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}' \
+  --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION"
+
+# Wait until the image state is CREATED (poll get-microvm-image); ~5-10 min.
+IMAGE_ARN="arn:aws:lambda:$AWS_REGION:$AWS_ACCOUNT:microvm-image:$IMAGE_NAME"
+aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" --query state
+
+# 3c. Launch a MicroVM. Ingress connectors expose HTTP (the terminal) and SHELL
+#     (the tools/ helpers); the egress connector reaches the S3 Files mount targets.
+aws lambda-microvms run-microvm \
+  --image-identifier "$IMAGE_ARN" \
+  --execution-role-arn "$EXECUTION_ROLE" \
+  --idle-policy '{"maxIdleDurationSeconds":1800,"suspendedDurationSeconds":600,"autoResumeEnabled":true}' \
+  --maximum-duration-in-seconds 28800 \
+  --ingress-network-connectors "[\"arn:aws:lambda:$AWS_REGION:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:$AWS_REGION:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
+  --egress-network-connectors "[\"$NETWORK_CONNECTOR_ARN\"]" \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION"
+```
+
+The `run-microvm` response includes the `microvmId` and `endpoint`. The token
+Lambda finds the running VM via SSM parameters, so store them:
+
+```bash
+# (use the microvmId / endpoint from the run-microvm output)
+aws ssm put-parameter --name /ipad-claude/mvm-identifier --value "$MVM_ID" \
+  --type String --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
+aws ssm put-parameter --name /ipad-claude/mvm-endpoint --value "$MVM_ENDPOINT" \
+  --type String --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
+```
+
+Also set the login password once (the token Lambda validates against it):
+
+```bash
+aws ssm put-parameter --name /ipad-claude/password --value "choose-a-password" \
+  --type SecureString --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
+```
+
+Now open the CloudFront URL, log in with any email + that password, and you're
+in the terminal.
+
+### …or just run the script
+
+Once you understand the stages, `scripts/deploy.sh` does all of the above
+end-to-end (it also auto-generates the password on first run, polls the image
+build, terminates the previous MicroVM, and smoke-tests the result):
+
+```bash
+./scripts/deploy.sh
+```
 
 | Flag | Effect |
 |---|---|
-| *(none)* | Full deploy: CDK + frontend + image build + fresh MicroVM |
-| `--skip-cdk` | Reuse the existing stack; rebuild image + relaunch |
-| `--skip-image` | Reuse the existing image; just relaunch the MicroVM |
-| `--skip-mvm` | Deploy infra/image but don't launch a new MicroVM |
-| `--recreate-image` | Delete + recreate the image (needed to change OS capabilities) |
+| *(none)* | Full deploy: Stage 1 + 2 + 3 |
+| `--skip-cdk` | Skip Stage 1; rebuild image + relaunch (Stage 3) |
+| `--skip-image` | Skip the image build; just relaunch the MicroVM (Stage 3c) |
+| `--skip-mvm` | Do Stages 1–2 and the image build, but don't launch a MicroVM |
+| `--recreate-image` | Delete + recreate the image (required to change OS capabilities) |
+
+> **Updating an existing image** uses `aws lambda-microvms update-microvm-image`
+> with the *same* flags as create — capabilities, hooks, and env vars reset to
+> defaults unless you re-pass them every time. Changing OS capabilities requires
+> a delete + recreate (`--recreate-image`), since `--additional-os-capabilities`
+> only applies at create time.
 
 ---
 
