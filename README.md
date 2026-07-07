@@ -222,8 +222,7 @@ the egress connector reaches the S3 Files mount targets.
 
 ### Stage 4 — Create a user
 
-Auth is Cognito with no self-signup, so create users yourself. They set a
-permanent password on first login.
+Auth is Cognito with no self-signup, so you create users yourself:
 
 ```bash
 USER_POOL_ID=$(out UserPoolId)
@@ -232,12 +231,28 @@ aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
   --username you@example.com \
   --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \
+  --temporary-password 'ChangeMe-123!' \
   --profile "$AWS_PROFILE" --region "$AWS_REGION"
 ```
 
-Now open the CloudFront URL, sign in with that email and the temporary password
-Cognito emailed (or that you set via `admin-set-user-password --permanent`), and
-you're in the terminal — with your own MicroVM and persistent home.
+This creates the user with a **temporary password**. On first sign-in the app
+prompts them to choose a new permanent one (Cognito's standard
+`NEW_PASSWORD_REQUIRED` flow, which the login screen handles).
+
+- Pass `--temporary-password '...'` (as above) to set the temp password yourself.
+- Omit it and Cognito generates one and emails the user — only works if the pool
+  has email/SES sending configured, which this template does not set up, so
+  prefer passing it explicitly.
+- To skip the first-login prompt entirely and set a ready-to-use password:
+  ```bash
+  aws cognito-idp admin-set-user-password \
+    --user-pool-id "$USER_POOL_ID" --username you@example.com \
+    --password 'YourReal-Password1!' --permanent \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION"
+  ```
+
+Now open the CloudFront URL, sign in with that email and password, and you're in
+the terminal — with your own MicroVM and persistent home.
 
 ### …or just run the script
 
