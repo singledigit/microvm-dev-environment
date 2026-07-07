@@ -4,6 +4,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
@@ -228,6 +229,34 @@ export class IpadClaudeStack extends cdk.Stack {
       },
     });
 
+    // ── Cognito: user pool (admin-created users only, no self-signup) ─────────
+    const userPool = new cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'ipad-claude-users',
+      selfSignUpEnabled: false,          // admins create users; no public registration
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      standardAttributes: { email: { required: true, mutable: false } },
+      passwordPolicy: {
+        minLength: 12,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+      },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // SPA app client — public (no secret), USER_PASSWORD auth for the custom form.
+    const userPoolClient = userPool.addClient('WebClient', {
+      userPoolClientName: 'ipad-claude-web',
+      authFlows: { userPassword: true, userSrp: true },
+      generateSecret: false,
+      accessTokenValidity: cdk.Duration.hours(1),
+      idTokenValidity: cdk.Duration.hours(1),
+      refreshTokenValidity: cdk.Duration.days(30),
+    });
+
     // ── IAM: Token vending Lambda role ────────────────────────────────────────
     const tokenLambdaRole = new iam.Role(this, 'TokenLambdaRole', {
       roleName: 'IpadClaudeTokenLambdaRole',
@@ -245,9 +274,16 @@ export class IpadClaudeStack extends cdk.Stack {
                 `arn:aws:ssm:${region}:${account}:parameter/ipad-claude/*`,
               ],
             }),
+            // Per-user S3 Files access points (created on first login, scoped
+            // to /users/<sub> so each user gets an isolated home directory).
             new iam.PolicyStatement({
               effect: iam.Effect.ALLOW,
-              actions: ['ses:SendEmail', 'ses:SendRawEmail'],
+              actions: [
+                's3files:CreateAccessPoint',
+                's3files:GetAccessPoint',
+                's3files:ListAccessPoints',
+                's3files:DeleteAccessPoint',
+              ],
               resources: ['*'],
             }),
             // MicroVM lifecycle + token creation
@@ -280,30 +316,41 @@ export class IpadClaudeStack extends cdk.Stack {
       role: tokenLambdaRole,
       timeout: cdk.Duration.seconds(30),
       environment: {
-        MVM_IDENTIFIER_PARAM: '/ipad-claude/mvm-identifier',
         ALLOWED_ORIGINS: '*',
         IMAGE_ARN: `arn:aws:lambda:${region}:${account}:microvm-image:ipad-claude-v2`,
         EXECUTION_ROLE_ARN: executionRole.roleArn,
         NETWORK_CONNECTOR_ARN: cdk.Lazy.string({ produce: () => networkConnector.getAtt('Arn').toString() }),
+        // Per-user home mounts: the Lambda creates an access point per user on
+        // this filesystem and passes its id to the MicroVM at launch.
+        S3_FILES_FS_ID: s3FilesFileSystemId,
+        WORKSPACE_BUCKET_ARN: workspaceBucket.bucketArn,
       },
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/token-vend')),
     });
 
-    // ── API Gateway: token endpoint ───────────────────────────────────────────
+    // ── API Gateway: token endpoint (Cognito-authorized) ──────────────────────
     const api = new apigateway.RestApi(this, 'TokenApi', {
       restApiName: 'ipad-claude-token-api',
       description: 'Vends short-lived MicroVM auth tokens',
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: ['GET', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'X-Login-Email', 'X-Login-Password'],
+        allowHeaders: ['Content-Type', 'Authorization'],
       },
+    });
+
+    // API Gateway validates the Cognito JWT before the Lambda ever runs.
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'TokenAuthorizer', {
+      cognitoUserPools: [userPool],
     });
 
     const tokenResource = api.root.addResource('token');
     tokenResource.addMethod('GET', new apigateway.LambdaIntegration(tokenFn, {
       timeout: cdk.Duration.seconds(29),
-    }));
+    }), {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
 
     // ── S3: Frontend hosting bucket ───────────────────────────────────────────
     const frontendBucket = new s3.Bucket(this, 'FrontendBucket', {
@@ -415,6 +462,16 @@ export class IpadClaudeStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'TokenApiUrl', {
       value: `${api.url}token`,
       exportName: 'IpadClaudeTokenApiUrl',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      exportName: 'IpadClaudeUserPoolId',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+      exportName: 'IpadClaudeUserPoolClientId',
     });
 
     new cdk.CfnOutput(this, 'FrontendUrl', {

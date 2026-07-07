@@ -13,18 +13,9 @@ async function putParam(name, value) {
   await ssm.send(new PutParameterCommand({ Name: name, Value: value, Type: 'String', Overwrite: true }));
 }
 
-function timingSafeCompare(a, b) {
-  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
-  const len = Math.max(ba.length, bb.length);
-  const pa = Buffer.alloc(len), pb = Buffer.alloc(len);
-  ba.copy(pa); bb.copy(pb);
-  return crypto.timingSafeEqual(pa, pb);
-}
-
-function sigv4Request(method, hostname, path, body) {
+function sigv4Request(method, hostname, path, body, service = 'lambda') {
   return new Promise((resolve, reject) => {
     const region = process.env.AWS_REGION;
-    const service = 'lambda';
     const accessKey = process.env.AWS_ACCESS_KEY_ID;
     const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
     const sessionToken = process.env.AWS_SESSION_TOKEN;
@@ -76,6 +67,34 @@ function sigv4Request(method, hostname, path, body) {
 
 const region = () => process.env.AWS_REGION;
 const mvmHost = () => `lambda.${region()}.amazonaws.com`;
+const s3filesHost = () => `s3files.${region()}.amazonaws.com`;
+
+// Find-or-create an S3 Files access point scoped to /users/<sub>, so each
+// Cognito user gets an isolated home directory on the shared filesystem.
+// Idempotent: the access-point id is cached in SSM per user after first login.
+async function ensureUserAccessPoint(sub) {
+  const fsId = process.env.S3_FILES_FS_ID;
+  const cacheParam = `/ipad-claude/users/${sub}/access-point-id`;
+
+  try {
+    const cached = await getParam(cacheParam);
+    if (cached) return cached;
+  } catch (e) { /* not created yet */ }
+
+  const body = {
+    fileSystemId: fsId,
+    posixUser: { uid: 1000, gid: 1000 },
+    rootDirectory: {
+      path: `/users/${sub}`,
+      creationPermissions: { ownerUid: 1000, ownerGid: 1000, permissions: '0755' },
+    },
+    clientToken: `ap-${sub}`.slice(0, 64), // idempotent create per user
+  };
+  const data = await sigv4Request('PUT', s3filesHost(), '/access-points', body, 's3files');
+  const apId = data.accessPointId;
+  await putParam(cacheParam, apId);
+  return apId;
+}
 
 async function getMvmState(mvmId) {
   try {
@@ -91,7 +110,7 @@ async function resumeMvm(mvmId) {
   await sigv4Request('POST', mvmHost(), `/2025-09-09/microvms/${encodeURIComponent(mvmId)}/resume`, {});
 }
 
-async function runNewMvm() {
+async function runNewMvm(accessPointId) {
   const imageArn = process.env.IMAGE_ARN;
   const executionRoleArn = process.env.EXECUTION_ROLE_ARN;
   const networkConnectorArn = process.env.NETWORK_CONNECTOR_ARN;
@@ -110,6 +129,10 @@ async function runNewMvm() {
       `arn:aws:lambda:${region()}:aws:network-connector:aws-network-connector:SHELL_INGRESS`,
     ],
     ...(networkConnectorArn ? { egressNetworkConnectors: [networkConnectorArn] } : {}),
+    // Per-VM data delivered as the body of the /run hook. The hook writes the
+    // access-point id to a file that entrypoint.sh reads to mount this user's
+    // home directory (see microvm/hooks.js + entrypoint.sh).
+    ...(accessPointId ? { runHookPayload: JSON.stringify({ accessPointId }) } : {}),
   };
 
   const data = await sigv4Request('POST', mvmHost(), '/2025-09-09/microvms', body);
@@ -133,7 +156,7 @@ exports.handler = async (event) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': process.env.ALLOWED_ORIGINS || '*',
     'Access-Control-Allow-Methods': 'GET,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,X-Login-Email,X-Login-Password',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
   };
 
   const method = event.requestContext?.http?.method || event.httpMethod || 'GET';
@@ -142,27 +165,23 @@ exports.handler = async (event) => {
   }
 
   // ── Auth ──────────────────────────────────────────────────────────────────
-  const reqHeaders = event.headers || {};
-  const suppliedPw = reqHeaders['x-login-password'] || reqHeaders['X-Login-Password'] || '';
-  const isAuthCheck = (event.queryStringParameters?.auth === '1');
-
-  let storedPw;
-  try {
-    storedPw = await getParam('/ipad-claude/password', true);
-  } catch (e) {
-    return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: 'Config error' }) };
-  }
-
-  if (!suppliedPw || !timingSafeCompare(suppliedPw, storedPw)) {
+  // API Gateway's Cognito authorizer already validated the JWT before we ran;
+  // the verified claims are in the request context. We just read the user id.
+  const claims = event.requestContext?.authorizer?.claims
+    || event.requestContext?.authorizer?.jwt?.claims
+    || {};
+  const sub = claims.sub;
+  if (!sub) {
+    // Should be unreachable (authorizer blocks unauthenticated calls), but fail
+    // closed if the method is ever misconfigured without the authorizer.
     return { statusCode: 401, headers: corsHeaders, body: JSON.stringify({ error: 'Unauthorized' }) };
   }
 
-  // Auth-only check (login screen validation)
-  if (isAuthCheck) {
-    return { statusCode: 200, headers: corsHeaders, body: JSON.stringify({ ok: true }) };
-  }
+  // Per-user SSM keys — each user has their own MicroVM + home.
+  const mvmIdParam = `/ipad-claude/users/${sub}/mvm-identifier`;
+  const mvmEndpointParam = `/ipad-claude/users/${sub}/mvm-endpoint`;
 
-  // ── Ensure a live MicroVM exists ──────────────────────────────────────────
+  // ── Ensure a live MicroVM exists for THIS user ────────────────────────────
   try {
     let mvmId = '';
     let mvmEndpoint = '';
@@ -172,11 +191,11 @@ exports.handler = async (event) => {
 
     try {
       [mvmId, mvmEndpoint] = await Promise.all([
-        getParam('/ipad-claude/mvm-identifier'),
-        getParam('/ipad-claude/mvm-endpoint'),
+        getParam(mvmIdParam),
+        getParam(mvmEndpointParam),
       ]);
     } catch (e) {
-      console.log('SSM params missing, will launch new MVM');
+      console.log('No MVM for this user yet, will launch one');
     }
 
     if (mvmId) {
@@ -199,15 +218,17 @@ exports.handler = async (event) => {
     }
 
     if (!mvmId) {
-      console.log('Launching new MicroVM…');
+      console.log(`Launching new MicroVM for user ${sub}…`);
       vmState = 'starting';
-      const result = await runNewMvm();
+      // Find-or-create this user's home (access point scoped to /users/<sub>).
+      const accessPointId = await ensureUserAccessPoint(sub);
+      const result = await runNewMvm(accessPointId);
       mvmId = result.mvmId;
       mvmEndpoint = result.endpoint;
-      // Persist so future calls (and deploy script) see the new IDs
+      // Persist so future calls see this user's MVM.
       await Promise.all([
-        putParam('/ipad-claude/mvm-identifier', mvmId),
-        putParam('/ipad-claude/mvm-endpoint', mvmEndpoint),
+        putParam(mvmIdParam, mvmId),
+        putParam(mvmEndpointParam, mvmEndpoint),
       ]);
       console.log(`New MVM launched: ${mvmId}`);
       // Give snapshot boot a moment

@@ -57,7 +57,18 @@ const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', d => { body += d; });
     req.on('end', () => {
-      console.log(`Hook: ${url} (mount already done in entrypoint)`);
+      // Per-VM payload from RunMicroVm: the user's S3 Files access-point id.
+      // entrypoint.sh waits for this file, then mounts THIS user's home.
+      try {
+        const payload = JSON.parse(body || '{}');
+        if (payload.accessPointId) {
+          fs.writeFileSync('/tmp/access-point-id', String(payload.accessPointId));
+          console.log(`Hook ${url}: wrote access-point id`);
+        }
+      } catch (e) {
+        console.error('Failed to parse run payload:', e.message);
+      }
+      console.log(`Hook: ${url}`);
       res.writeHead(200); res.end();
       // Disk blocks are demand-paged from snapshot storage (~3MB/s first
       // touch). Prefetch what a Claude session needs — node_modules for the
