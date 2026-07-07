@@ -52,35 +52,8 @@ if [ "$ACTUAL_ACCOUNT" != "$ACCOUNT" ]; then
 fi
 ok "Authenticated as $(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")"
 
-# ── Generate password (first time) or read existing ───────────────────────────
-EXISTING_PW=$(aws ssm get-parameter \
-  --name "/ipad-claude/password" \
-  --with-decryption \
-  --profile "$PROFILE" \
-  --region "$REGION" \
-  --query 'Parameter.Value' \
-  --output text 2>/dev/null || echo "")
-
-if [ -z "$EXISTING_PW" ]; then
-  log "Generating new password..."
-  # 20 chars: letters + digits only (no special chars that confuse terminals)
-  PORTAL_PASSWORD=$(python3 -c "
-import secrets, string
-chars = string.ascii_letters + string.digits
-print(''.join(secrets.choice(chars) for _ in range(20)))
-")
-  aws ssm put-parameter \
-    --name "/ipad-claude/password" \
-    --value "$PORTAL_PASSWORD" \
-    --type "SecureString" \
-    --overwrite \
-    --profile "$PROFILE" \
-    --region "$REGION" > /dev/null
-  ok "Password stored in SSM (SecureString)"
-else
-  PORTAL_PASSWORD="$EXISTING_PW"
-  ok "Using existing password from SSM"
-fi
+# Auth is Cognito now (no shared password). Users are admin-created in the pool;
+# see the "create a user" command printed in the summary below.
 
 # ── CDK deploy ────────────────────────────────────────────────────────────────
 if [ "$SKIP_CDK" = false ]; then
@@ -127,6 +100,8 @@ TOKEN_API_URL=$(read_output TokenApiUrl)
 FRONTEND_URL=$(read_output FrontendUrl)
 FRONTEND_BUCKET=$(read_output FrontendBucketName)
 CF_DIST_ID=$(read_output CloudFrontDistributionId)
+USER_POOL_ID=$(read_output UserPoolId 2>/dev/null || echo "")
+USER_POOL_CLIENT_ID=$(read_output UserPoolClientId 2>/dev/null || echo "")
 
 ok "Artifact bucket : $ARTIFACT_BUCKET"
 ok "Token API       : $TOKEN_API_URL"
@@ -145,23 +120,23 @@ NETWORK_CONNECTOR_ARN=$(aws cloudformation describe-stacks \
   --query "Stacks[0].Outputs[?OutputKey=='NetworkConnectorArn'].OutputValue" \
   --output text 2>/dev/null || echo "")
 
-# ── Inject TOKEN_API_URL into frontend ────────────────────────────────────────
-log "Injecting token API URL into frontend..."
+# ── Inject runtime config into frontend (token API + Cognito ids) ─────────────
+# index.html ships with an APP_CONFIG placeholder; fill it at deploy time. We
+# render to a temp copy so the committed file keeps its placeholder (no
+# account-specific values ever land in git).
+log "Injecting runtime config into frontend..."
 FRONTEND_FILE="$ROOT_DIR/frontend/index.html"
-if grep -q "<script>window\.TOKEN_API_URL" "$FRONTEND_FILE"; then
-  # Already injected — update the value
-  sed -i.bak "s|window\.TOKEN_API_URL = '[^']*'|window.TOKEN_API_URL = '$TOKEN_API_URL'|g" "$FRONTEND_FILE"
-  rm -f "${FRONTEND_FILE}.bak"
-else
-  # Inject right before </title>
-  sed -i.bak "s|</title>|</title>\n  <script>window.TOKEN_API_URL = '$TOKEN_API_URL';</script>|" "$FRONTEND_FILE"
-  rm -f "${FRONTEND_FILE}.bak"
-fi
+RENDERED=/tmp/ipad-claude-index.html
+APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$REGION\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\"}"
+# Replace the whole placeholder <script> line with the injected config.
+sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
+  "$FRONTEND_FILE" > "$RENDERED"
 
-# Sync updated frontend
+# Sync updated frontend (render replaces the placeholder file in the upload dir)
 log "Syncing frontend to S3 ($FRONTEND_BUCKET)..."
-aws s3 sync "$ROOT_DIR/frontend/" "s3://$FRONTEND_BUCKET/" \
-  --profile "$PROFILE" --delete
+cp "$RENDERED" "$ROOT_DIR/frontend/index.html.rendered"
+aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" --profile "$PROFILE"
+rm -f "$ROOT_DIR/frontend/index.html.rendered"
 
 if [ -n "$CF_DIST_ID" ]; then
   aws cloudfront create-invalidation \
@@ -296,28 +271,29 @@ else
   ok "Using existing image: $IMAGE_ID"
 fi
 
-# ── Run MicroVM ────────────────────────────────────────────────────────────────
+# ── Smoke-test MicroVM (throwaway) ──────────────────────────────────────────────
+# Per-user MVMs are launched on demand by the token Lambda at login (keyed to
+# the Cognito user), NOT here. This launches ONE throwaway VM purely to smoke-
+# test the freshly-built image end-to-end, then terminates it. To exercise the
+# real per-user mount path, we create a temporary access point and pass its id
+# via --run-hook-payload, exactly as the Lambda does.
+SMOKE_AP=""
 if [ "$SKIP_MVM" = false ]; then
-  # Terminate any existing MicroVM first
-  OLD_MVM_ID=$(aws ssm get-parameter \
-    --name "/ipad-claude/mvm-identifier" \
-    --profile "$PROFILE" --region "$REGION" \
-    --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-  if [ -n "$OLD_MVM_ID" ] && [ "$OLD_MVM_ID" != "None" ]; then
-    log "Terminating old MicroVM: $OLD_MVM_ID..."
-    aws lambda-microvms terminate-microvm \
-      --microvm-identifier "$OLD_MVM_ID" \
-      --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
-  fi
-
   # Build egress connector flag
   EGRESS_FLAG=""
   if [ -n "$NETWORK_CONNECTOR_ARN" ] && [ "$NETWORK_CONNECTOR_ARN" != "None" ]; then
     EGRESS_FLAG="--egress-network-connectors [\"$NETWORK_CONNECTOR_ARN\"]"
   fi
 
-  log "Launching MicroVM..."
-  # GA run-microvm returns clean JSON with microvmId + endpoint — no debug scrape needed.
+  log "Creating throwaway access point for smoke test..."
+  SMOKE_AP=$(aws s3files create-access-point \
+    --file-system-id "$S3_FILES_FS_ID" \
+    --posix-user 'uid=1000,gid=1000' \
+    --root-directory 'path=/users/_smoketest,creationPermissions={ownerUid=1000,ownerGid=1000,permissions=0755}' \
+    --profile "$PROFILE" --region "$REGION" \
+    --query 'accessPointId' --output text 2>/dev/null || echo "")
+
+  log "Launching smoke-test MicroVM..."
   RUN_OUT=$(aws lambda-microvms run-microvm \
     --image-identifier "$IMAGE_ID" \
     --execution-role-arn "$EXECUTION_ROLE" \
@@ -325,6 +301,7 @@ if [ "$SKIP_MVM" = false ]; then
     --maximum-duration-in-seconds 28800 \
     --ingress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
     $EGRESS_FLAG \
+    ${SMOKE_AP:+--run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}"} \
     --profile "$PROFILE" \
     --region "$REGION" \
     --output json 2>&1)
@@ -343,58 +320,52 @@ print(ep if ep.startswith('https://') else 'https://' + ep)
     exit 1
   fi
 
-  ok "MicroVM launched: $MVM_ID"
+  ok "Smoke-test MicroVM launched: $MVM_ID"
   ok "Endpoint: $MVM_ENDPOINT"
-
-  # Store in SSM
-  log "Storing MicroVM ID and endpoint in SSM..."
-  aws ssm put-parameter --name "/ipad-claude/mvm-identifier" --value "$MVM_ID" \
-    --type String --overwrite --profile "$PROFILE" --region "$REGION" > /dev/null
-  aws ssm put-parameter --name "/ipad-claude/mvm-endpoint" --value "$MVM_ENDPOINT" \
-    --type String --overwrite --profile "$PROFILE" --region "$REGION" > /dev/null
-  ok "Stored in SSM"
-
-  # MicroVM starts up immediately from snapshot; give it 10s then probe
-  sleep 10
+  # Give snapshot boot + /run-hook mount a moment before probing
+  sleep 15
   MVM_STATE="RUNNING"
-  ok "MicroVM should be RUNNING (snapshot boot)"
 else
-  log "Skipping MVM launch (--skip-mvm)"
-  MVM_ID=$(aws ssm get-parameter \
-    --name "/ipad-claude/mvm-identifier" \
-    --profile "$PROFILE" --region "$REGION" \
-    --query 'Parameter.Value' --output text)
-  MVM_ENDPOINT=$(aws ssm get-parameter \
-    --name "/ipad-claude/mvm-endpoint" \
-    --profile "$PROFILE" --region "$REGION" \
-    --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-  MVM_STATE="RUNNING"
-  ok "Using existing MVM: $MVM_ID"
+  log "Skipping MVM smoke test (--skip-mvm)"
+  MVM_ID=""
+  MVM_ENDPOINT=""
+  MVM_STATE="not launched"
 fi
 
-# ── Smoke test ────────────────────────────────────────────────────────────────
-log "Smoke-testing ttyd (port 8080)..."
-SMOKE_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
-  --microvm-identifier "$MVM_ID" \
-  --expiration-in-minutes 5 \
-  --allowed-ports '[{"port":8080}]' \
-  --profile "$PROFILE" \
-  --region "$REGION" \
-  --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
+# ── Smoke test + teardown of the throwaway VM ───────────────────────────────────
+if [ "$SKIP_MVM" = false ] && [ -n "$MVM_ID" ]; then
+  log "Smoke-testing ttyd (port 8080)..."
+  SMOKE_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
+    --microvm-identifier "$MVM_ID" \
+    --expiration-in-minutes 5 \
+    --allowed-ports '[{"port":8080}]' \
+    --profile "$PROFILE" \
+    --region "$REGION" \
+    --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
 
-if [ -n "$SMOKE_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
-  HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -H "X-aws-proxy-auth: $SMOKE_TOKEN" \
-    --max-time 15 \
-    "$MVM_ENDPOINT/" 2>/dev/null || echo "000")
-  if [[ "$HTTP_STATUS" =~ ^[23] ]]; then
-    ok "ttyd responding (HTTP $HTTP_STATUS)"
-  else
-    log "ttyd returned HTTP $HTTP_STATUS — may still be warming up"
+  if [ -n "$SMOKE_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
+    HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+      -H "X-aws-proxy-auth: $SMOKE_TOKEN" \
+      --max-time 15 \
+      "$MVM_ENDPOINT/" 2>/dev/null || echo "000")
+    if [[ "$HTTP_STATUS" =~ ^[23] ]]; then
+      ok "ttyd responding (HTTP $HTTP_STATUS)"
+    else
+      log "ttyd returned HTTP $HTTP_STATUS — may still be warming up"
+    fi
   fi
-fi
 
-# Email notifications removed — credentials shown in summary below
+  # Tear down the throwaway smoke-test VM + access point — real per-user VMs
+  # are launched by the token Lambda at login.
+  log "Tearing down smoke-test VM..."
+  aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID" \
+    --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+  if [ -n "$SMOKE_AP" ] && [ "$SMOKE_AP" != "None" ]; then
+    aws s3files delete-access-point --access-point-id "$SMOKE_AP" \
+      --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+  fi
+  MVM_STATE="smoke-tested + torn down"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -403,11 +374,18 @@ echo "  iPad Claude Code — Deployed Successfully"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Frontend URL : $FRONTEND_URL"
 echo "  Token API    : $TOKEN_API_URL"
-echo "  MicroVM ID   : $MVM_ID"
-echo "  MVM State    : $MVM_STATE"
+echo "  Smoke test   : $MVM_STATE"
+echo "  User pool    : $USER_POOL_ID"
 echo ""
-echo "  Login:"
-echo "    Email    : ${LOGIN_EMAIL:-any email (not validated)}"
-echo "    Password : $PORTAL_PASSWORD"
+echo "  Auth is Cognito (admin-created users, no self-signup)."
+echo "  Create a user (they'll set a password on first login):"
+echo ""
+echo "    aws cognito-idp admin-create-user \\"
+echo "      --user-pool-id $USER_POOL_ID \\"
+echo "      --username ${LOGIN_EMAIL:-you@example.com} \\"
+echo "      --user-attributes Name=email,Value=${LOGIN_EMAIL:-you@example.com} Name=email_verified,Value=true \\"
+echo "      --profile $PROFILE --region $REGION"
+echo ""
+echo "  Then open $FRONTEND_URL and sign in."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""

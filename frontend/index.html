@@ -7,7 +7,9 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>Claude Code</title>
-  <script>window.TOKEN_API_URL = '__TOKEN_API_URL__';</script>
+  <!-- deploy.sh replaces the whole APP_CONFIG line with the real config JSON -->
+  <script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
+  <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -199,27 +201,36 @@
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
 <script>
 // ── Config ──────────────────────────────────────────────────────────────────
-const TOKEN_API_URL = window.TOKEN_API_URL || document.querySelector('meta[name="token-api-url"]')?.content || '';
+const CONFIG = window.APP_CONFIG || {};
+const TOKEN_API_URL = CONFIG.tokenApiUrl || '';
 
-// ── Login / session persistence ───────────────────────────────────────────────
-const STORAGE_KEY = 'ipadclaude_session';
-let sessionPassword = null;
+// ── Cognito auth ──────────────────────────────────────────────────────────────
+// amazon-cognito-identity-js persists sessions in localStorage and refreshes
+// tokens automatically. We authenticate against the user pool (no self-signup —
+// users are admin-created), then send the resulting JWT to the token API, where
+// API Gateway's Cognito authorizer validates it before the Lambda runs.
+const userPool = (CONFIG.userPoolId && CONFIG.userPoolClientId)
+  ? new AmazonCognitoIdentity.CognitoUserPool({
+      UserPoolId: CONFIG.userPoolId,
+      ClientId: CONFIG.userPoolClientId,
+    })
+  : null;
 
-function loadSavedSession() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (e) { return null; }
-}
+let cognitoUser = null;   // current CognitoUser (set after login)
 
-function saveSession(email, password) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ email, password }));
-}
-
-function clearSession() {
-  localStorage.removeItem(STORAGE_KEY);
-  sessionPassword = null;
+// Return a valid ID-token JWT, refreshing via the stored refresh token if the
+// cached session has expired. Rejects if there's no valid session.
+function getIdToken() {
+  return new Promise((resolve, reject) => {
+    const user = cognitoUser || userPool?.getCurrentUser();
+    if (!user) return reject(new Error('Not signed in'));
+    user.getSession((err, session) => {
+      if (err) return reject(err);
+      if (!session.isValid()) return reject(new Error('Session expired'));
+      cognitoUser = user;
+      resolve(session.getIdToken().getJwtToken());
+    });
+  });
 }
 
 async function doLogin() {
@@ -230,26 +241,40 @@ async function doLogin() {
 
   errEl.textContent = '';
   if (!email || !password) { errEl.textContent = 'Enter email and password.'; return; }
+  if (!userPool) { errEl.textContent = 'Auth not configured. Re-run the deploy.'; return; }
 
   btn.disabled = true;
   btn.textContent = 'Signing in…';
+  const done = () => { btn.disabled = false; btn.textContent = 'Sign In'; };
 
-  try {
-    const resp = await fetch(`${TOKEN_API_URL}?auth=1`, {
-      headers: { 'X-Login-Email': email, 'X-Login-Password': password },
-    });
-    if (resp.status === 401) { errEl.textContent = 'Invalid credentials.'; return; }
-    if (!resp.ok) { errEl.textContent = `Error ${resp.status}. Try again.`; return; }
+  const user = new AmazonCognitoIdentity.CognitoUser({ Username: email, Pool: userPool });
+  const authDetails = new AmazonCognitoIdentity.AuthenticationDetails({ Username: email, Password: password });
 
-    sessionPassword = password;
-    saveSession(email, password);
-    showApp();
-  } catch (e) {
-    errEl.textContent = `Network error: ${e.message}`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Sign In';
-  }
+  user.authenticateUser(authDetails, {
+    onSuccess: () => { cognitoUser = user; done(); showApp(); },
+    onFailure: (err) => {
+      done();
+      errEl.textContent = err.code === 'NotAuthorizedException' || err.code === 'UserNotFoundException'
+        ? 'Invalid credentials.' : (err.message || 'Sign-in failed.');
+    },
+    // Admin-created users must set a permanent password on first login.
+    newPasswordRequired: () => {
+      done();
+      const newPw = window.prompt('First sign-in — choose a new password (min 12 chars):');
+      if (!newPw) { errEl.textContent = 'A new password is required on first login.'; return; }
+      btn.disabled = true; btn.textContent = 'Setting password…';
+      user.completeNewPasswordChallenge(newPw, {}, {
+        onSuccess: () => { cognitoUser = user; done(); showApp(); },
+        onFailure: (e) => { done(); errEl.textContent = e.message || 'Could not set password.'; },
+      });
+    },
+  });
+}
+
+function signOut() {
+  try { (cognitoUser || userPool?.getCurrentUser())?.signOut(); } catch {}
+  cognitoUser = null;
+  location.reload();
 }
 
 function showApp() {
@@ -258,21 +283,13 @@ function showApp() {
   start();
 }
 
-// Allow Enter key on password field
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('login-password')?.addEventListener('keydown', e => {
     if (e.key === 'Enter') doLogin();
   });
 
-  // Auto-login if we have a saved session
-  const saved = loadSavedSession();
-  if (saved && saved.password) {
-    sessionPassword = saved.password;
-    // Pre-fill email for visual confirmation, then skip login
-    const emailEl = document.getElementById('login-email');
-    if (emailEl) emailEl.value = saved.email || '';
-    showApp();
-  }
+  // Resume an existing Cognito session if one is stored and still valid.
+  getIdToken().then(() => showApp()).catch(() => {/* show login */});
 });
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -309,8 +326,10 @@ function clearError() {
 
 // ── Token fetch ──────────────────────────────────────────────────────────────
 async function fetchToken() {
-  const headers = sessionPassword ? { 'X-Login-Password': sessionPassword } : {};
-  const resp = await fetch(TOKEN_API_URL, { headers });
+  // API Gateway's Cognito authorizer expects the JWT in Authorization.
+  const jwt = await getIdToken();
+  const resp = await fetch(TOKEN_API_URL, { headers: { Authorization: `Bearer ${jwt}` } });
+  if (resp.status === 401) { signOut(); throw new Error('Session expired — please sign in again'); }
   if (!resp.ok) throw new Error(`Token API ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
   authToken = data.authToken;
