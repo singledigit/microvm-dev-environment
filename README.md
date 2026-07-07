@@ -98,24 +98,32 @@ anything by hand — `sam deploy` makes it all.
 
 ---
 
-## Deploy — the three stages
+## Deploying
 
-The system has three deployable layers, and it's worth understanding each one
-before reaching for the script. Configure first, then walk the stages. (There's
-a one-command script at the end — but do it by hand once; that's the point of
-this repo.)
+**The one command that does everything is `./scripts/deploy.sh`** (see
+[Just run the script](#just-run-the-script) below). If you only want a working
+deployment, skip there.
 
-**Configure.** Copy the example and fill in your values:
+The rest of this section walks the four layers by hand — infra, frontend, image,
+user — so you can see what the script automates. The snippets build on each
+other: run them in **one shell session**, top to bottom, after the Configure
+step. They're a teaching aid, not a substitute for the script.
+
+### Configure
 
 ```bash
 cp config.env.example config.env
-$EDITOR config.env       # AWS_ACCOUNT, AWS_PROFILE, region, ...
-source config.env        # export the vars for the commands below
+$EDITOR config.env       # set AWS_ACCOUNT, AWS_PROFILE, AWS_REGION, ...
+source config.env        # exports AWS_PROFILE / AWS_REGION / IMAGE_NAME / STACK_NAME
+
+# Helper used by every stage below — pulls one stack output by key.
+# (Depends on the vars just sourced; define it in this same shell.)
+out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 ```
 
-`config.env` is git-ignored, so your account ID never gets committed. The
-commands below assume `$AWS_PROFILE`, `$AWS_REGION`, `$AWS_ACCOUNT`, and
-`$IMAGE_NAME` are exported from it.
+`config.env` is git-ignored, so your account ID never gets committed.
 
 ### Stage 1 — Infrastructure (SAM)
 
@@ -129,7 +137,7 @@ network connector.
 sam build
 
 sam deploy \
-  --stack-name ipad-claude \
+  --stack-name "$STACK_NAME" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --parameter-overrides "ImageName=$IMAGE_NAME" \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -138,38 +146,33 @@ sam deploy \
 
 `samconfig.toml` already sets the stack name, capabilities, and `resolve_s3`, so
 after the first run a bare `sam deploy` works too. The stack CREATES the S3 Files
-filesystem — no manual filesystem step. Read the outputs (bucket names, role
-ARNs, token API URL, CloudFront URL, network connector ARN, S3 Files id, Cognito
-ids) back with, e.g.:
+filesystem — no manual filesystem step. Inspect all outputs any time with:
 
 ```bash
-aws cloudformation describe-stacks --stack-name ipad-claude \
+aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --query "Stacks[0].Outputs" --output table
 ```
 
 ### Stage 2 — Frontend (S3 + CloudFront)
 
-The frontend is one static `index.html`. It ships with an `APP_CONFIG`
-placeholder; substitute the token API URL + Cognito ids from Stage 1's outputs,
-upload to the frontend bucket, and invalidate the CDN.
+The frontend is one static `index.html` with a placeholder line
+`window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */`. Replace it with the real
+config — token API URL, region, and Cognito pool/client ids from Stage 1's
+outputs — then upload and invalidate the CDN.
 
 ```bash
-# Helper: pull any stack output by key.
-out() { aws cloudformation describe-stacks --stack-name ipad-claude \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+CONFIG=$(cat <<JSON
+{"tokenApiUrl":"$(out TokenApiUrl)","region":"$AWS_REGION","userPoolId":"$(out UserPoolId)","userPoolClientId":"$(out UserPoolClientId)"}
+JSON
+)
 
-TOKEN_API_URL=$(out TokenApiUrl)
-FRONTEND_BUCKET=$(out FrontendBucketName)
-CF_DIST_ID=$(out CloudFrontDistributionId)
+# Replace the whole placeholder line with the injected config.
+sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $CONFIG;</script>|" \
+  frontend/index.html > /tmp/index.html
 
-# Inject the token API URL, then upload.
-sed "s|__TOKEN_API_URL__|$TOKEN_API_URL|g" frontend/index.html > /tmp/index.html
-aws s3 cp /tmp/index.html "s3://$FRONTEND_BUCKET/index.html" --profile "$AWS_PROFILE"
-
-# Bust the CloudFront cache so the new page is served immediately.
-aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" \
+aws s3 cp /tmp/index.html "s3://$(out FrontendBucketName)/index.html" --profile "$AWS_PROFILE"
+aws cloudfront create-invalidation --distribution-id "$(out CloudFrontDistributionId)" \
   --paths "/*" --profile "$AWS_PROFILE"
 ```
 
@@ -179,7 +182,6 @@ Two steps: build the image (zip the `microvm/` dir → upload to the artifact
 bucket → create/update the MicroVM image), then run a MicroVM from it.
 
 ```bash
-# (uses the out() helper from Stage 2)
 BUILD_ROLE=$(out BuildRoleArn)
 EXECUTION_ROLE=$(out ExecutionRoleArn)
 ARTIFACT_BUCKET=$(out ArtifactBucketName)
@@ -254,12 +256,13 @@ prompts them to choose a new permanent one (Cognito's standard
 Now open the CloudFront URL, sign in with that email and password, and you're in
 the terminal — with your own MicroVM and persistent home.
 
-### …or just run the script
+### Just run the script
 
-Once you understand the stages, `scripts/deploy.sh` does all of the above
-end-to-end (builds/updates the image, launches a throwaway VM to smoke-test it,
-tears it down, and prints the `admin-create-user` command). It does **not**
-launch a persistent VM — that happens per user at login:
+`scripts/deploy.sh` does all of the above end-to-end: `sam build` + `sam deploy`,
+injects the frontend config and uploads it, builds/updates the MicroVM image,
+launches a throwaway VM to smoke-test it and tears it down, then prints the
+`admin-create-user` command. It does **not** launch a persistent VM — that
+happens per user at login.
 
 ```bash
 ./scripts/deploy.sh
