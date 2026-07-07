@@ -73,13 +73,39 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       // /run carries the per-VM runHookPayload with this user's access-point
       // id; persist it so /resume (which has no payload) can reuse it.
+      // CONFIRMED delivery shape: the platform wraps our payload in an envelope
+      // — body is {"runHookPayload":"{\"accessPointId\":\"fsap-...\"}"} (a
+      // JSON string nested inside JSON). We parse defensively (envelope key,
+      // raw JSON, and base64 variants) so it's robust to shape changes.
+      // The raw body is logged as a one-liner for future diagnosis.
+      try { fs.appendFileSync('/tmp/hooks.log', `RAW ${url} BODY=[${(body||'').slice(0, 200)}]\n`); } catch {}
       let accessPointId = '';
+      const tryExtract = (s) => {
+        if (!s) return '';
+        // direct field
+        try { const o = JSON.parse(s); if (o && o.accessPointId) return String(o.accessPointId); } catch {}
+        return '';
+      };
       try {
-        const payload = JSON.parse(body || '{}');
-        if (payload.accessPointId) {
-          accessPointId = String(payload.accessPointId);
-          fs.writeFileSync(AP_FILE, accessPointId);
+        const candidates = [];
+        const raw = body || '';
+        candidates.push(raw);                                   // raw JSON
+        try { candidates.push(Buffer.from(raw, 'base64').toString('utf8')); } catch {}
+        // envelope: {"runHookPayload":"<raw-or-base64>"} or {"payload":"..."}
+        try {
+          const env = JSON.parse(raw);
+          for (const k of ['runHookPayload', 'payload', 'RunHookPayload']) {
+            if (env && typeof env[k] === 'string') {
+              candidates.push(env[k]);
+              try { candidates.push(Buffer.from(env[k], 'base64').toString('utf8')); } catch {}
+            }
+          }
+        } catch {}
+        for (const c of candidates) {
+          const ap = tryExtract(c);
+          if (ap) { accessPointId = ap; break; }
         }
+        if (accessPointId) fs.writeFileSync(AP_FILE, accessPointId);
       } catch (e) {
         console.error('Failed to parse run payload:', e.message);
       }
