@@ -298,20 +298,24 @@ export AWS_PROFILE=your-profile AWS_REGION=us-east-1
 cd tools && npm install && cd ..   # first time only (installs the `ws` client)
 ```
 
-- **Interactive shell into the MicroVM** (SSH-equivalent, over SHELL_INGRESS):
+MicroVMs are per-user, so both tools need to know **which** user's VM to reach —
+pass `--user <email>` (or set `IPAD_CLAUDE_USER`). The user must have logged in
+at least once so their VM exists.
+
+- **Interactive shell into a user's MicroVM** (SSH-equivalent, over SHELL_INGRESS):
 
   ```bash
-  node tools/exec.js            # drops to the `coder` user (zsh)
-  node tools/exec.js --root     # stay root (system changes don't persist)
+  node tools/exec.js --user you@example.com          # drops to the `coder` user (zsh)
+  node tools/exec.js --user you@example.com --root   # stay root (changes don't persist)
   ```
 
   Double `Ctrl+C` to disconnect.
 
-- **Run a one-off command in the MicroVM** (non-interactive — handy for scripting
-  or quick inspection):
+- **Run a one-off command in a user's MicroVM** (non-interactive — handy for
+  scripting or quick inspection):
 
   ```bash
-  node tools/run-remote.js 'uname -a' 60      # command, optional timeout (sec)
+  node tools/run-remote.js --user you@example.com 'uname -a' 60   # cmd, optional timeout
   ```
 
 - **Logs / debugging:** `cat /tmp/hooks.log` inside the MicroVM shows the S3
@@ -366,8 +370,9 @@ microvm/              MicroVM image
 scripts/
   deploy.sh           end-to-end deploy (SAM + frontend + image + smoke test)
 tools/                optional break-glass utilities for a running MicroVM
-  exec.js / exec.sh   interactive local shell into the MicroVM
+  exec.js / exec.sh   interactive local shell into a user's MicroVM
   run-remote.js       non-interactive remote command runner
+  resolve-mvm.js      shared: email → Cognito sub → per-user MicroVM
 config.env.example    copy to config.env and fill in
 ```
 

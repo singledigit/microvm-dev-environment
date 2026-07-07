@@ -332,9 +332,19 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # The models are `us.anthropic.*` cross-region inference profiles.
+              # Invoking one needs BOTH the inference-profile ARN (in the deploy
+              # region) AND the underlying foundation-model ARNs in every region
+              # the US profile can route to (us-east-1 / us-east-2 / us-west-2).
+              # This is redundant while PowerUserAccess is attached, but makes the
+              # README's "scope PowerUserAccess down" advice actually safe.
               - Effect: Allow
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*"
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-*"
+                  - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-*
+                  - arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-*
+                  - arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-*
               - Effect: Allow
                 Action: [s3files:ClientMount, s3files:ClientWrite]
                 Resource: "*"

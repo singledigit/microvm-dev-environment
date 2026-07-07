@@ -125,10 +125,16 @@ if [ "$SKIP_IMAGE" = false ]; then
   log "Packaging MicroVM source..."
   ZIP_KEY="ipad-claude-microvm.zip"
   rm -f /tmp/"$ZIP_KEY"
-  # Inject S3_FILES_FS_ID into Dockerfile before zipping
-  sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$ROOT_DIR/microvm/Dockerfile"
-  rm -f "$ROOT_DIR/microvm/Dockerfile.bak"
-  (cd "$ROOT_DIR/microvm" && zip -r /tmp/"$ZIP_KEY" . -x "*.DS_Store" > /dev/null)
+  # Render the image source to a temp build dir so the tracked microvm/ files
+  # stay pristine (never bake the account-specific FS id into git). Only the
+  # Dockerfile's __S3_FILES_FS_ID__ placeholder is substituted. (The FS id is
+  # ALSO passed via --environment-variables at image create; the ENV line is
+  # the belt-and-suspenders copy for a plain `docker build`.)
+  BUILD_DIR="/tmp/ipad-claude-microvm-build"
+  rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
+  sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
+  rm -f "$BUILD_DIR/Dockerfile.bak"
+  (cd "$BUILD_DIR" && zip -r /tmp/"$ZIP_KEY" . -x "*.DS_Store" > /dev/null)
   aws s3 cp /tmp/"$ZIP_KEY" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" \
     --profile "$PROFILE"
   ok "Source uploaded to s3://$ARTIFACT_BUCKET/$ZIP_KEY"
@@ -165,13 +171,20 @@ if [ "$SKIP_IMAGE" = false ]; then
   # --additional-os-capabilities only applies at CREATE time; update ignores it.
   # To change capabilities, the image must be deleted and recreated.
   if [ "$RECREATE_IMAGE" = true ] && [ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "None" ]; then
-    log "Recreating image — terminating any MVM referencing it, then deleting..."
-    OLD_MVM_ID=$(aws ssm get-parameter --name "/ipad-claude/mvm-identifier" \
-      --profile "$PROFILE" --region "$REGION" \
-      --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-    if [ -n "$OLD_MVM_ID" ] && [ "$OLD_MVM_ID" != "None" ]; then
+    log "Recreating image — terminating all per-user MVMs referencing it..."
+    # MVMs are per-user now (/ipad-claude/users/<sub>/mvm-identifier); any of
+    # them may reference the image, so terminate them all before deleting it.
+    TERMINATED=false
+    for OLD_MVM_ID in $(aws ssm get-parameters-by-path --path /ipad-claude/users --recursive \
+        --profile "$PROFILE" --region "$REGION" \
+        --query "Parameters[?ends_with(Name,'mvm-identifier')].Value" --output text 2>/dev/null); do
+      [ -z "$OLD_MVM_ID" ] || [ "$OLD_MVM_ID" = "None" ] && continue
       aws lambda-microvms terminate-microvm --microvm-identifier "$OLD_MVM_ID" \
         --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+      log "Terminated $OLD_MVM_ID"
+      TERMINATED=true
+    done
+    if [ "$TERMINATED" = true ]; then
       log "Waiting 15s for MVM termination to release the image..."
       sleep 15
     fi

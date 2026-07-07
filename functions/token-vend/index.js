@@ -125,7 +125,7 @@ async function runNewMvm(accessPointId) {
     },
     maximumDurationInSeconds: 28800,
     ingressNetworkConnectors: [
-      'arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:HTTP_INGRESS',
+      `arn:aws:lambda:${region()}:aws:network-connector:aws-network-connector:HTTP_INGRESS`,
       `arn:aws:lambda:${region()}:aws:network-connector:aws-network-connector:SHELL_INGRESS`,
     ],
     ...(networkConnectorArn ? { egressNetworkConnectors: [networkConnectorArn] } : {}),

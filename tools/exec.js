@@ -1,48 +1,23 @@
 #!/usr/bin/env node
-// Local shell client for the iPad Claude MicroVM.
-// Usage: node scripts/exec.js [--profile <profile>] [--region <region>]
-// Requires: npm install ws  (or uses cdk/node_modules/ws if present)
+// Interactive shell client for a user's iPad Claude MicroVM (SHELL_INGRESS).
+// Usage: node tools/exec.js --user <email> [--root]
+//   (or set IPAD_CLAUDE_USER=<email> instead of --user)
+// Requires: cd tools && npm install  (installs the `ws` client)
 
-const { spawnSync } = require('child_process');
 const path = require('path');
-
-const WS_MOD = (() => {
-  const candidates = [
-    path.join(__dirname, 'node_modules/ws'),
-    path.join(__dirname, '../cdk/node_modules/ws'),
-  ];
-  for (const p of candidates) {
-    try { return require(p); } catch {}
-  }
-  console.error('ws module not found. Run: cd scripts && npm install');
-  process.exit(1);
-})();
-const WebSocket = WS_MOD;
+const WebSocket = require(path.join(__dirname, 'node_modules/ws'));
+const { aws, userArg, resolveMvm } = require('./resolve-mvm');
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
-const profile = args[args.indexOf('--profile') + 1] || process.env.AWS_PROFILE || 'default';
-const region  = args[args.indexOf('--region')  + 1] || process.env.AWS_REGION  || 'us-east-1';
-const asRoot  = args.includes('--root'); // stay as root instead of dropping to coder
-
-function aws(...parts) {
-  const cmd = ['aws', ...parts, '--profile', profile, '--region', region, '--output', 'text'];
-  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8' });
-  if (r.status !== 0) throw new Error(r.stderr?.trim() || `aws command failed: ${parts[0]}`);
-  return r.stdout.trim();
-}
+const email = userArg(args);
+const asRoot = args.includes('--root'); // stay as root instead of dropping to coder
 
 async function main() {
-  // ── Get MVM ID + endpoint from SSM ────────────────────────────────────────
-  process.stderr.write('Fetching MicroVM info from SSM...\n');
+  // ── Resolve this user's MicroVM ───────────────────────────────────────────
   let mvmId, endpoint;
-  try {
-    mvmId    = aws('ssm', 'get-parameter', '--name', '/ipad-claude/mvm-identifier', '--query', 'Parameter.Value');
-    endpoint = aws('ssm', 'get-parameter', '--name', '/ipad-claude/mvm-endpoint',   '--query', 'Parameter.Value');
-  } catch (e) {
-    console.error('Could not read SSM params:', e.message);
-    process.exit(1);
-  }
+  try { ({ mvmId, endpoint } = resolveMvm(email)); }
+  catch (e) { console.error(e.message); process.exit(1); }
   process.stderr.write(`MVM: ${mvmId}\n`);
 
   // ── Mint shell auth token ─────────────────────────────────────────────────

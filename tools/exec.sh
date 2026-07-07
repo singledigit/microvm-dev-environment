@@ -1,6 +1,6 @@
 #!/bin/bash
-# Connect a local shell to the running iPad Claude MicroVM.
-# Usage: ./scripts/exec.sh [--profile <profile>] [--region <region>]
+# Connect an interactive shell to a user's iPad Claude MicroVM.
+# Usage: ./tools/exec.sh --user <email> [--root]
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 exec node "$DIR/exec.js" "$@"

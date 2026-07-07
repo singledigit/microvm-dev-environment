@@ -1,26 +1,28 @@
 #!/usr/bin/env node
-// Non-interactive command runner for the iPad Claude MicroVM (SHELL_INGRESS).
-// Usage: node scripts/run-remote.js 'command to run' [timeout-seconds]
+// Non-interactive command runner for a user's iPad Claude MicroVM (SHELL_INGRESS).
+// Usage: node tools/run-remote.js --user <email> 'command' [timeout-seconds]
+//   (or set IPAD_CLAUDE_USER=<email> instead of --user)
 // Prints the command's output between BEGIN/END markers and exits.
 
-const { spawnSync } = require('child_process');
 const path = require('path');
 const WebSocket = require(path.join(__dirname, 'node_modules/ws'));
+const { aws, userArg, resolveMvm } = require('./resolve-mvm');
 
-const cmd = process.argv[2];
-const timeoutSec = parseInt(process.argv[3] || '120', 10);
-if (!cmd) { console.error('Usage: run-remote.js <command> [timeout-sec]'); process.exit(1); }
-
-const PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = process.env.AWS_REGION || 'us-east-1';
-function aws(...parts) {
-  const r = spawnSync('aws', [...parts, '--profile', PROFILE, '--region', REGION, '--output', 'text'], { encoding: 'utf8' });
-  if (r.status !== 0) throw new Error(r.stderr?.trim());
-  return r.stdout.trim();
+// Positional args are everything that isn't the --user <email> pair.
+const argv = process.argv.slice(2);
+const email = userArg(argv);
+const positional = argv.filter((a, i) => a !== '--user' && argv[i - 1] !== '--user');
+const cmd = positional[0];
+const timeoutSec = parseInt(positional[1] || '120', 10);
+if (!cmd) {
+  console.error("Usage: run-remote.js --user <email> '<command>' [timeout-sec]");
+  process.exit(1);
 }
 
-const mvmId = aws('ssm', 'get-parameter', '--name', '/ipad-claude/mvm-identifier', '--query', 'Parameter.Value');
-const endpoint = aws('ssm', 'get-parameter', '--name', '/ipad-claude/mvm-endpoint', '--query', 'Parameter.Value');
+let mvmId, endpoint;
+try { ({ mvmId, endpoint } = resolveMvm(email)); }
+catch (e) { console.error(e.message); process.exit(1); }
+
 const token = aws('lambda-microvms', 'create-microvm-shell-auth-token',
   '--microvm-identifier', mvmId, '--expiration-in-minutes', '10',
   '--query', 'authToken."X-aws-proxy-auth"');
