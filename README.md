@@ -16,22 +16,30 @@ tools are still there.
 
 ## How it works
 
-```
-  Browser (xterm.js)                    AWS
-  ┌────────────────┐   HTTPS      ┌──────────────────────────────┐
-  │  login screen  │ ───────────▶ │  API Gateway → token Lambda  │  validates password,
-  │                │  password    │                              │  ensures a MicroVM is
-  │                │ ◀─────────── │  returns {token, endpoint}   │  running, mints a token
-  │                │   token      └──────────────────────────────┘
-  │                │
-  │   terminal     │   WebSocket (wss, ttyd protocol)
-  │   (xterm.js)   │ ═══════════════════════════════▶  Lambda MicroVM
-  └────────────────┘   auth via subprotocol            ┌────────────────────────┐
-        ▲                                               │ terminal.js (PTY :8080)│
-        │ served by                                     │ zsh → claude (Bedrock) │
-  ┌─────────────┐                                       │ /home/coder ← S3 Files │
-  │ CloudFront  │ ← S3 (frontend/index.html)            └────────────────────────┘
-  └─────────────┘
+```mermaid
+flowchart LR
+    subgraph browser["Browser (iPad / desktop)"]
+        UI["xterm.js terminal<br/>+ login screen"]
+    end
+
+    CF["CloudFront"]
+    S3F["S3 (frontend/index.html)"]
+    APIGW["API Gateway<br/>→ token Lambda"]
+
+    subgraph mvm["Lambda MicroVM"]
+        TERM["terminal.js — PTY :8080<br/>zsh → claude (Bedrock)"]
+        HOME["/home/coder"]
+    end
+
+    S3FILES["S3 Files<br/>(persistent home)"]
+
+    S3F -. served by .-> CF
+    CF -->|loads app| UI
+    UI -->|"HTTPS: password"| APIGW
+    APIGW -->|"{ token, endpoint }"| UI
+    UI ==>|"WebSocket (wss, ttyd protocol)<br/>auth via subprotocol"| TERM
+    APIGW -. "resumes / launches,<br/>mints token" .-> mvm
+    HOME <-->|NFS mount| S3FILES
 ```
 
 - **Frontend** — a single `index.html` (xterm.js) on S3, served via CloudFront.
