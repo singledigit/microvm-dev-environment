@@ -7,10 +7,10 @@ log in, and you're in a real shell with Claude Code running against Amazon
 Bedrock. Close the tab and come back later — your files, history, and installed
 tools are still there.
 
-> ⚠️ **This is a demo / personal-sandbox project, not a hardened multi-tenant
-> product.** It uses a single shared password and a broadly-privileged AWS role.
-> Read the [Security](#security) section before deploying anywhere others can
-> reach it.
+> ⚠️ **This is a demo / small-team project, not a hardened product.** Auth is
+> Cognito (admin-created users, per-user MicroVMs), but the sandbox runs with a
+> broadly-privileged AWS role. Read the [Security](#security) section before
+> deploying anywhere sensitive.
 
 ---
 
@@ -24,40 +24,54 @@ flowchart LR
 
     CF["CloudFront"]
     S3F["S3 (frontend/index.html)"]
-    APIGW["API Gateway<br/>→ token Lambda"]
+    COG["Cognito User Pool<br/>(admin-created users)"]
+    APIGW["API Gateway<br/>(Cognito authorizer)<br/>→ token Lambda"]
 
-    subgraph mvm["Lambda MicroVM"]
+    subgraph mvm["Per-user Lambda MicroVM"]
         TERM["terminal.js — PTY :8080<br/>zsh → claude (Bedrock)"]
         HOME["/home/coder"]
     end
 
-    S3FILES["S3 Files<br/>(persistent home)"]
+    S3FILES["S3 Files access point<br/>/users/&lt;sub&gt; (persistent home)"]
 
     S3F -. served by .-> CF
     CF -->|loads app| UI
-    UI -->|"HTTPS: password"| APIGW
-    APIGW -->|"{ token, endpoint }"| UI
+    UI -->|"sign in (password)"| COG
+    COG -->|JWT| UI
+    UI -->|"HTTPS: Bearer JWT"| APIGW
+    APIGW -->|"validates JWT, then<br/>{ token, endpoint }"| UI
     UI ==>|"WebSocket (wss, ttyd protocol)<br/>auth via subprotocol"| TERM
-    APIGW -. "resumes / launches,<br/>mints token" .-> mvm
-    HOME <-->|NFS mount| S3FILES
+    APIGW -. "launches this user's VM,<br/>mints token" .-> mvm
+    HOME <-->|"NFS mount<br/>(-o accesspoint)"| S3FILES
 ```
 
 - **Frontend** — a single `index.html` (xterm.js) on S3, served via CloudFront.
-  Login validates a password, then opens a WebSocket straight to the MicroVM's
-  service-managed endpoint, authenticating via the `lambda-microvms.*`
-  subprotocols. On the wire it speaks the ttyd binary protocol.
-- **Token Lambda** (behind API Gateway) — validates the password (stored in SSM
-  Parameter Store), then resumes a suspended MicroVM or launches a fresh one,
-  and mints a short-lived auth token. Uses hand-rolled SigV4 so it's immune to
-  AWS CLI command-name churn.
+  The user signs in against Cognito (via `amazon-cognito-identity-js`), gets a
+  JWT, then opens a WebSocket straight to their MicroVM's service-managed
+  endpoint, authenticating via the `lambda-microvms.*` subprotocols. On the wire
+  it speaks the ttyd binary protocol.
+- **Auth — Cognito + API Gateway.** A Cognito User Pool holds admin-created
+  users (no self-signup). **API Gateway's Cognito authorizer validates the JWT
+  before the token Lambda ever runs** — the Lambda never sees a password, only
+  the already-verified identity.
+- **Token Lambda** — reads the verified Cognito `sub` from the request context,
+  finds-or-creates that user's S3 Files access point (scoped to `/users/<sub>`),
+  launches or resumes **that user's own MicroVM**, and mints a short-lived auth
+  token. Hand-rolled SigV4, so it's immune to AWS CLI command-name churn.
 - **MicroVM image** — Amazon Linux 2023 + Node, Python 3.13, the AWS CLI, `uv`,
-  and Claude Code (pointed at Bedrock). `terminal.js` is a WebSocket PTY server
-  (one shared shell, multiple attach/detach clients). `/home/coder` is an S3
-  Files (NFS) mount, so the home directory persists across restarts and image
-  rebuilds.
+  and Claude Code (pointed at Bedrock). `terminal.js` is a WebSocket PTY server.
+  The per-user home is mounted at run time by the `/run` lifecycle hook (which
+  receives the access-point id in its payload) — `mount -o accesspoint=<id>` —
+  so each user gets an isolated `/home/coder` that persists across restarts.
 - **CDK stack** — VPC + security group, the S3 buckets (frontend / artifacts /
-  workspace), IAM roles, the token Lambda + API Gateway, CloudFront, and a
+  workspace), the S3 Files filesystem + mount targets, the Cognito pool +
+  authorizer, IAM roles, the token Lambda + API Gateway, CloudFront, and a
   Lambda Network Connector for VPC egress to the S3 Files mount targets.
+
+**Per-user isolation:** each Cognito user gets their own MicroVM and their own
+home directory (an S3 Files access point scoped to their `sub`). Adding a user
+in the pool is all it takes — their first login provisions their VM and home on
+demand.
 
 Default model is **Claude Opus 4.8** on Bedrock; `/model` switches to Fable 5,
 Sonnet 5, or Haiku 4.5 (Fable requires US data residency, hence Opus as the
@@ -204,44 +218,40 @@ IMAGE_ARN="arn:aws:lambda:$AWS_REGION:$AWS_ACCOUNT:microvm-image:$IMAGE_NAME"
 aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" --query state
 
-# 3c. Launch a MicroVM. Ingress connectors expose HTTP (the terminal) and SHELL
-#     (the tools/ helpers); the egress connector reaches the S3 Files mount targets.
-aws lambda-microvms run-microvm \
-  --image-identifier "$IMAGE_ARN" \
-  --execution-role-arn "$EXECUTION_ROLE" \
-  --idle-policy '{"maxIdleDurationSeconds":1800,"suspendedDurationSeconds":600,"autoResumeEnabled":true}' \
-  --maximum-duration-in-seconds 28800 \
-  --ingress-network-connectors "[\"arn:aws:lambda:$AWS_REGION:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:$AWS_REGION:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
-  --egress-network-connectors "[\"$NETWORK_CONNECTOR_ARN\"]" \
+```
+
+That's the image. **You don't launch a MicroVM here** — the token Lambda does
+that per user, on demand: when a user logs in, it reads their verified Cognito
+`sub`, creates their S3 Files access point, and calls `run-microvm` with the
+access-point id in `--run-hook-payload` (the `/run` hook mounts it). The
+ingress connectors expose HTTP (the terminal) and SHELL (the `tools/` helpers);
+the egress connector reaches the S3 Files mount targets.
+
+### Stage 4 — Create a user
+
+Auth is Cognito with no self-signup, so create users yourself. They set a
+permanent password on first login.
+
+```bash
+USER_POOL_ID=$(out UserPoolId)
+
+aws cognito-idp admin-create-user \
+  --user-pool-id "$USER_POOL_ID" \
+  --username you@example.com \
+  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \
   --profile "$AWS_PROFILE" --region "$AWS_REGION"
 ```
 
-The `run-microvm` response includes the `microvmId` and `endpoint`. The token
-Lambda finds the running VM via SSM parameters, so store them:
-
-```bash
-# (use the microvmId / endpoint from the run-microvm output)
-aws ssm put-parameter --name /ipad-claude/mvm-identifier --value "$MVM_ID" \
-  --type String --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
-aws ssm put-parameter --name /ipad-claude/mvm-endpoint --value "$MVM_ENDPOINT" \
-  --type String --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
-```
-
-Also set the login password once (the token Lambda validates against it):
-
-```bash
-aws ssm put-parameter --name /ipad-claude/password --value "choose-a-password" \
-  --type SecureString --overwrite --profile "$AWS_PROFILE" --region "$AWS_REGION"
-```
-
-Now open the CloudFront URL, log in with any email + that password, and you're
-in the terminal.
+Now open the CloudFront URL, sign in with that email and the temporary password
+Cognito emailed (or that you set via `admin-set-user-password --permanent`), and
+you're in the terminal — with your own MicroVM and persistent home.
 
 ### …or just run the script
 
 Once you understand the stages, `scripts/deploy.sh` does all of the above
-end-to-end (it also auto-generates the password on first run, polls the image
-build, terminates the previous MicroVM, and smoke-tests the result):
+end-to-end (builds/updates the image, launches a throwaway VM to smoke-test it,
+tears it down, and prints the `admin-create-user` command). It does **not**
+launch a persistent VM — that happens per user at login:
 
 ```bash
 ./scripts/deploy.sh
@@ -301,26 +311,29 @@ cd tools && npm install && cd ..   # first time only (installs the `ws` client)
 
 ## Security
 
-This project is designed as a **single-user sandbox**. Be deliberate before
-exposing it more broadly:
+Auth and isolation are real (Cognito + per-user MicroVMs + per-user homes), but
+a few things still warrant care before you point it at anything sensitive:
 
-- **Single shared password.** One password (in SSM) gates the whole terminal.
-  There are no user accounts. Anyone with the URL and password gets a root-
-  capable shell (the `coder` user has passwordless `sudo`).
-- **Broad AWS privileges.** The MicroVM runs as `MicroVmExecutionRole`, which
-  has **`PowerUserAccess`** — full access to AWS services *except* IAM and
-  Organizations management. Anything Claude (or anyone in the terminal) runs can
-  use those credentials, resolved automatically from the instance role via
-  IMDS. Scope this down in `cdk/lib/stack.ts` (`MicroVmExecutionRole`) to only
-  the services your sandbox needs before using it anywhere shared.
-- **Bedrock spend.** The sandbox can call Bedrock freely; there's no budget cap
-  wired in. Add one if you're worried about runaway usage.
-- **No network isolation of the workload.** The MicroVM has open outbound
-  internet by default.
+- **Auth is Cognito, per-user.** Users are admin-created (no self-signup); each
+  gets their own MicroVM and a home directory isolated to their `sub`. API
+  Gateway validates the JWT before the Lambda runs. Note the `coder` user has
+  passwordless `sudo` **inside their own VM** — fine, since the VM and home are
+  per-user, but it does mean a user is root within their own sandbox.
+- **Broad AWS privileges — the main thing to scope.** The MicroVM runs as
+  `MicroVmExecutionRole`, which has **`PowerUserAccess`** — full access to AWS
+  services *except* IAM and Organizations management. Anything Claude (or the
+  user) runs in the terminal can use those credentials, resolved automatically
+  from the instance role via IMDS, **and every user's VM shares this one role**.
+  Scope it down in `cdk/lib/stack.ts` (`MicroVmExecutionRole`) to only the
+  services your sandbox needs before using it anywhere real.
+- **Bedrock spend.** VMs can call Bedrock freely; there's no per-user budget cap
+  wired in. Add one if runaway usage is a concern.
+- **No network isolation of the workload.** MicroVMs have open outbound internet
+  by default.
 
-For a real multi-user deployment you'd want per-user auth, a scoped-down
-execution role, per-session MicroVMs, and spend controls — none of which are
-here.
+For a production multi-tenant deployment you'd additionally want a per-user
+(or per-tenant) scoped execution role rather than one shared `PowerUserAccess`
+role, plus spend controls and egress restrictions.
 
 ---
 
