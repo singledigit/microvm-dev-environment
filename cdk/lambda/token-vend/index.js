@@ -67,7 +67,7 @@ function sigv4Request(method, hostname, path, body, service = 'lambda') {
 
 const region = () => process.env.AWS_REGION;
 const mvmHost = () => `lambda.${region()}.amazonaws.com`;
-const s3filesHost = () => `s3files.${region()}.amazonaws.com`;
+const s3filesHost = () => `s3files.${region()}.api.aws`;
 
 // Find-or-create an S3 Files access point scoped to /users/<sub>, so each
 // Cognito user gets an isolated home directory on the shared filesystem.
