@@ -69,8 +69,9 @@ RUN npm init -y && npm install node-pty ws && npm cache clean --force
 
 COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
+COPY mount-home.sh /opt/app/mount-home.sh
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.

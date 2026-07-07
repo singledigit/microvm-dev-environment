@@ -1,15 +1,29 @@
-// Lifecycle hooks server — handles suspend/terminate unmount, plus a
-// background disk prefetch on /run. Mount is done eagerly in entrypoint.sh
-// before this server starts.
+// Lifecycle hooks server. The per-user S3 Files home is mounted HERE (on /run
+// and /resume), not in entrypoint.sh: the image snapshot is shared across all
+// VMs, so the mount can't be baked in at build time — each VM mounts its own
+// user's access point at run time, and the access-point id arrives in the /run
+// payload. Also handles suspend/terminate unmount and a startup disk prefetch.
 const http = require('http');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
 
 const BASE = '/aws/lambda-microvms/runtime/v1';
 const MOUNT_PATH = '/home/coder';
+const AP_FILE = '/tmp/access-point-id';
 let appReady = false;
 
 setTimeout(() => { appReady = true; }, 5000);
+
+// Mount this user's home in the background and return control immediately —
+// the hook must answer 200 within its timeout (~10s) while the mount has its
+// own retry budget. terminal.js waits for /tmp/home-ready before spawning the
+// shell, so a background mount fits the existing readiness contract.
+function mountHome(accessPointId) {
+  const child = spawn('/bin/bash', ['/opt/app/mount-home.sh', accessPointId || ''],
+    { detached: true, stdio: 'ignore' });
+  child.unref();
+  console.log(`mountHome launched (accesspoint=${accessPointId || 'none'})`);
+}
 
 let prefetchStarted = false;
 function prefetchDisk() {
@@ -57,24 +71,29 @@ const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', d => { body += d; });
     req.on('end', () => {
-      // Per-VM payload from RunMicroVm: the user's S3 Files access-point id.
-      // entrypoint.sh waits for this file, then mounts THIS user's home.
+      // /run carries the per-VM runHookPayload with this user's access-point
+      // id; persist it so /resume (which has no payload) can reuse it.
+      let accessPointId = '';
       try {
         const payload = JSON.parse(body || '{}');
         if (payload.accessPointId) {
-          fs.writeFileSync('/tmp/access-point-id', String(payload.accessPointId));
-          console.log(`Hook ${url}: wrote access-point id`);
+          accessPointId = String(payload.accessPointId);
+          fs.writeFileSync(AP_FILE, accessPointId);
         }
       } catch (e) {
         console.error('Failed to parse run payload:', e.message);
       }
-      console.log(`Hook: ${url}`);
+      if (!accessPointId) {
+        // /resume, or a /run without payload — fall back to the persisted id.
+        try { accessPointId = fs.readFileSync(AP_FILE, 'utf8').trim(); } catch {}
+      }
+      console.log(`Hook: ${url} (accesspoint=${accessPointId || 'none'})`);
+      // Answer fast; the mount runs in the background (see mountHome).
       res.writeHead(200); res.end();
-      // Disk blocks are demand-paged from snapshot storage (~3MB/s first
-      // touch). Prefetch what a Claude session needs — node_modules for the
-      // terminal server, shared libs, coreutils — in the background at low IO
-      // priority so an early keystroke isn't competing with a cold read.
-      // The Claude CLI itself lives in tmpfs (memory snapshot), not here.
+      mountHome(accessPointId);
+      // Warm the demand-paged disk paths a Claude session needs (node_modules,
+      // shared libs, coreutils) once per boot. The Claude CLI itself is in
+      // tmpfs (memory snapshot), not here.
       if (url === `${BASE}/run`) prefetchDisk();
     });
     return;
