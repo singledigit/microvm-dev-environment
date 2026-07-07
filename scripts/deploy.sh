@@ -1,6 +1,10 @@
 #!/bin/bash
 # End-to-end deploy for ipad-claude
-# Usage: ./scripts/deploy.sh [--skip-cdk] [--skip-image] [--skip-mvm] [--recreate-image]
+# Usage: ./scripts/deploy.sh [--skip-infra] [--skip-image] [--skip-mvm] [--recreate-image]
+#   --skip-infra   reuse the existing SAM stack (skip sam build/deploy)
+#   --skip-image   reuse the existing MicroVM image (skip the image build)
+#   --skip-mvm     skip the throwaway smoke-test VM
+#   --recreate-image  delete + recreate the image (needed to change OS capabilities)
 set -euo pipefail
 
 # Resolve repo root from this script's location (no hardcoded path).
@@ -21,17 +25,15 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT in config.env}"
 IMAGE_NAME="${IMAGE_NAME:-ipad-claude-v2}"
 MVM_MEMORY="${MVM_MEMORY:-8192}"
-# Optional: reuse an existing S3 Files filesystem. Blank = the CDK stack creates
-# one, and we read its id back from the stack outputs after deploy.
-S3_FILES_FS_ID_CFG="${S3_FILES_FS_ID:-}"
+STACK_NAME="${STACK_NAME:-ipad-claude}"
 
-SKIP_CDK=false
+SKIP_INFRA=false
 SKIP_IMAGE=false
 SKIP_MVM=false
 RECREATE_IMAGE=false
 for arg in "$@"; do
   case $arg in
-    --skip-cdk)       SKIP_CDK=true ;;
+    --skip-infra)     SKIP_INFRA=true ;;
     --skip-image)     SKIP_IMAGE=true ;;
     --skip-mvm)       SKIP_MVM=true ;;
     --recreate-image) RECREATE_IMAGE=true ;;
@@ -55,70 +57,42 @@ ok "Authenticated as $(echo "$CALLER" | python3 -c "import sys,json; print(json.
 # Auth is Cognito now (no shared password). Users are admin-created in the pool;
 # see the "create a user" command printed in the summary below.
 
-# ── CDK deploy ────────────────────────────────────────────────────────────────
-if [ "$SKIP_CDK" = false ]; then
-  log "Installing CDK dependencies..."
-  (cd "$ROOT_DIR/cdk" && npm install --silent)
+# ── Infrastructure: SAM build + deploy ────────────────────────────────────────
+if [ "$SKIP_INFRA" = false ]; then
+  log "Building SAM application..."
+  (cd "$ROOT_DIR" && sam build --template template.yaml)
 
-  log "Bootstrapping CDK (idempotent)..."
-  (cd "$ROOT_DIR/cdk" && npx cdk bootstrap "aws://$ACCOUNT/$REGION" \
-    --profile "$PROFILE" \
-    --cloudformation-execution-policies "arn:aws:iam::aws:policy/AdministratorAccess" \
-    2>&1 | tail -3)
-
-  log "Deploying CDK stack..."
-  (cd "$ROOT_DIR/cdk" && CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION" \
-    npx cdk deploy IpadClaudeStack \
-    --profile "$PROFILE" \
-    --require-approval never \
-    -c s3FilesFileSystemId="$S3_FILES_FS_ID_CFG" \
-    --outputs-file /tmp/ipad-claude-outputs.json \
-    2>&1)
-  ok "CDK stack deployed"
+  log "Deploying SAM stack '$STACK_NAME'..."
+  (cd "$ROOT_DIR" && sam deploy \
+    --stack-name "$STACK_NAME" \
+    --profile "$PROFILE" --region "$REGION" \
+    --parameter-overrides "ImageName=$IMAGE_NAME" \
+    --no-confirm-changeset --no-fail-on-empty-changeset)
+  ok "SAM stack deployed"
 else
-  log "Skipping CDK (--skip-cdk), reading existing outputs..."
-  aws cloudformation describe-stacks \
-    --stack-name IpadClaudeStack \
-    --profile "$PROFILE" \
-    --region "$REGION" \
-    --query 'Stacks[0].Outputs' \
-    --output json \
-    | python3 -c "
-import sys, json
-outputs = {o['OutputKey']: o['OutputValue'] for o in json.load(sys.stdin)}
-result = {'IpadClaudeStack': outputs}
-print(json.dumps(result))
-" > /tmp/ipad-claude-outputs.json
+  log "Skipping infra (--skip-infra), using existing stack outputs..."
 fi
 
-# ── Read stack outputs ─────────────────────────────────────────────────────────
-read_output() { python3 -c "import json; d=json.load(open('/tmp/ipad-claude-outputs.json')); print(d['IpadClaudeStack']['$1'])"; }
-ARTIFACT_BUCKET=$(read_output ArtifactBucketName)
-BUILD_ROLE=$(read_output BuildRoleArn)
-EXECUTION_ROLE=$(read_output ExecutionRoleArn)
-TOKEN_API_URL=$(read_output TokenApiUrl)
-FRONTEND_URL=$(read_output FrontendUrl)
-FRONTEND_BUCKET=$(read_output FrontendBucketName)
-CF_DIST_ID=$(read_output CloudFrontDistributionId)
-USER_POOL_ID=$(read_output UserPoolId 2>/dev/null || echo "")
-USER_POOL_CLIENT_ID=$(read_output UserPoolClientId 2>/dev/null || echo "")
+# ── Read stack outputs (SAM creates a normal CloudFormation stack) ────────────
+out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --profile "$PROFILE" --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+
+ARTIFACT_BUCKET=$(out ArtifactBucketName)
+BUILD_ROLE=$(out BuildRoleArn)
+EXECUTION_ROLE=$(out ExecutionRoleArn)
+TOKEN_API_URL=$(out TokenApiUrl)
+FRONTEND_URL=$(out FrontendUrl)
+FRONTEND_BUCKET=$(out FrontendBucketName)
+CF_DIST_ID=$(out CloudFrontDistributionId)
+USER_POOL_ID=$(out UserPoolId)
+USER_POOL_CLIENT_ID=$(out UserPoolClientId)
+S3_FILES_FS_ID=$(out S3FilesFileSystemId)
+NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
 
 ok "Artifact bucket : $ARTIFACT_BUCKET"
 ok "Token API       : $TOKEN_API_URL"
 ok "Frontend        : $FRONTEND_URL"
-
-# Always read S3 Files and network connector from CloudFormation
-S3_FILES_FS_ID=$(aws cloudformation describe-stacks \
-  --stack-name IpadClaudeStack \
-  --profile "$PROFILE" --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='S3FilesFileSystemId'].OutputValue" \
-  --output text 2>/dev/null || echo "$S3_FILES_FS_ID_CFG")
-
-NETWORK_CONNECTOR_ARN=$(aws cloudformation describe-stacks \
-  --stack-name IpadClaudeStack \
-  --profile "$PROFILE" --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='NetworkConnectorArn'].OutputValue" \
-  --output text 2>/dev/null || echo "")
 
 # ── Inject runtime config into frontend (token API + Cognito ids) ─────────────
 # index.html ships with an APP_CONFIG placeholder; fill it at deploy time. We

@@ -63,10 +63,11 @@ flowchart LR
   The per-user home is mounted at run time by the `/run` lifecycle hook (which
   receives the access-point id in its payload) — `mount -o accesspoint=<id>` —
   so each user gets an isolated `/home/coder` that persists across restarts.
-- **CDK stack** — VPC + security group, the S3 buckets (frontend / artifacts /
-  workspace), the S3 Files filesystem + mount targets, the Cognito pool +
-  authorizer, IAM roles, the token Lambda + API Gateway, CloudFront, and a
-  Lambda Network Connector for VPC egress to the S3 Files mount targets.
+- **SAM template** (`template.yaml`) — VPC + security group, the S3 buckets
+  (frontend / artifacts / workspace), the S3 Files filesystem + mount targets,
+  the Cognito pool + authorizer, IAM roles, the token Lambda + API Gateway,
+  CloudFront, and a Lambda Network Connector for VPC egress to the S3 Files
+  mount targets. One `sam deploy` provisions all of it.
 
 **Per-user isolation:** each Cognito user gets their own MicroVM and their own
 home directory (an S3 Files access point scoped to their `sub`). Adding a user
@@ -88,13 +89,12 @@ portable default).
 - **AWS Lambda MicroVMs** available in your region (this project uses
   `us-east-1`). MicroVMs are a newer capability — make sure your account/region
   has access.
-- Local tooling: **AWS CLI v2**, **Node.js 20+**. Docker is *not* required — the
-  MicroVM image is built server-side by the build service.
+- Local tooling: **AWS CLI v2**, the **AWS SAM CLI**, and **Node.js 20+**. Docker
+  is *not* required — the MicroVM image is built server-side by the build service.
 
-The CDK stack provisions everything else, including the **S3 Files filesystem**
-and its VPC mount targets (the persistent `/home/coder`). You don't create it by
-hand. (If you'd rather point at an existing filesystem, set `S3_FILES_FS_ID` in
-`config.env` and the stack will reference it instead of creating one.)
+The SAM stack provisions everything, including the **S3 Files filesystem** and
+its VPC mount targets (the persistent per-user `/home/coder`). You don't create
+anything by hand — `sam deploy` makes it all.
 
 ---
 
@@ -115,55 +115,48 @@ source config.env        # export the vars for the commands below
 
 `config.env` is git-ignored, so your account ID never gets committed. The
 commands below assume `$AWS_PROFILE`, `$AWS_REGION`, `$AWS_ACCOUNT`, and
-`$IMAGE_NAME` are exported from it. `S3_FILES_FS_ID` is optional — leave it blank
-and Stage 1 creates the filesystem; set it to reuse an existing one.
+`$IMAGE_NAME` are exported from it.
 
-### Stage 1 — Infrastructure (CDK)
+### Stage 1 — Infrastructure (SAM)
 
-Provisions the VPC, security group, the three S3 buckets, all IAM roles, the
-token-vending Lambda + API Gateway, CloudFront, and the VPC-egress network
-connector. The S3 Files filesystem ID is passed in as context (the stack
-references it; it does not create it — see Prerequisites).
+The whole stack is one AWS SAM template (`template.yaml`): the VPC + NAT +
+subnets + NFS security group, the three S3 buckets, the **S3 Files filesystem +
+mount targets**, the Cognito user pool + client, the token-vending Lambda +
+API Gateway (with the Cognito authorizer), CloudFront, and the VPC-egress
+network connector.
 
 ```bash
-cd cdk
-npm install
+sam build
 
-# One-time per account/region: create the CDK toolkit stack.
-CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
-  npx cdk bootstrap "aws://$AWS_ACCOUNT/$AWS_REGION" --profile "$AWS_PROFILE"
-
-# Deploy the stack. This CREATES the S3 Files filesystem + mount targets (plus
-# everything else). To reuse an existing filesystem instead, add
-# `-c s3FilesFileSystemId=fs-...`.
-CDK_DEFAULT_ACCOUNT=$AWS_ACCOUNT CDK_DEFAULT_REGION=$AWS_REGION \
-  npx cdk deploy IpadClaudeStack \
-  --profile "$AWS_PROFILE" \
-  --require-approval never \
-  --outputs-file /tmp/ipad-claude-outputs.json
-cd ..
+sam deploy \
+  --stack-name ipad-claude \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --parameter-overrides "ImageName=$IMAGE_NAME" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --resolve-s3 --no-confirm-changeset
 ```
 
-The outputs file now holds the bucket names, role ARNs, the token API URL, the
-CloudFront URL, the network connector ARN, and the S3 Files filesystem id that
-the next two stages need.
-Read them back with, e.g.:
+`samconfig.toml` already sets the stack name, capabilities, and `resolve_s3`, so
+after the first run a bare `sam deploy` works too. The stack CREATES the S3 Files
+filesystem — no manual filesystem step. Read the outputs (bucket names, role
+ARNs, token API URL, CloudFront URL, network connector ARN, S3 Files id, Cognito
+ids) back with, e.g.:
 
 ```bash
-aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+aws cloudformation describe-stacks --stack-name ipad-claude \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --query "Stacks[0].Outputs" --output table
 ```
 
 ### Stage 2 — Frontend (S3 + CloudFront)
 
-The frontend is one static `index.html`. It ships with a `__TOKEN_API_URL__`
-placeholder; substitute the real token API URL from Stage 1's outputs, upload to
-the frontend bucket, and invalidate the CDN.
+The frontend is one static `index.html`. It ships with an `APP_CONFIG`
+placeholder; substitute the token API URL + Cognito ids from Stage 1's outputs,
+upload to the frontend bucket, and invalidate the CDN.
 
 ```bash
 # Helper: pull any stack output by key.
-out() { aws cloudformation describe-stacks --stack-name IpadClaudeStack \
+out() { aws cloudformation describe-stacks --stack-name ipad-claude \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 
@@ -259,10 +252,10 @@ launch a persistent VM — that happens per user at login:
 
 | Flag | Effect |
 |---|---|
-| *(none)* | Full deploy: Stage 1 + 2 + 3 |
-| `--skip-cdk` | Skip Stage 1; rebuild image + relaunch (Stage 3) |
-| `--skip-image` | Skip the image build; just relaunch the MicroVM (Stage 3c) |
-| `--skip-mvm` | Do Stages 1–2 and the image build, but don't launch a MicroVM |
+| *(none)* | Full deploy: SAM stack + frontend + image build + smoke test |
+| `--skip-infra` | Skip `sam build`/`sam deploy`; rebuild image + frontend only |
+| `--skip-image` | Skip the image build; frontend + smoke test only |
+| `--skip-mvm` | Deploy infra/image but skip the throwaway smoke-test VM |
 | `--recreate-image` | Delete + recreate the image (required to change OS capabilities) |
 
 > **Updating an existing image** uses `aws lambda-microvms update-microvm-image`
@@ -324,7 +317,7 @@ a few things still warrant care before you point it at anything sensitive:
   services *except* IAM and Organizations management. Anything Claude (or the
   user) runs in the terminal can use those credentials, resolved automatically
   from the instance role via IMDS, **and every user's VM shares this one role**.
-  Scope it down in `cdk/lib/stack.ts` (`MicroVmExecutionRole`) to only the
+  Scope it down in `template.yaml` (`MicroVmExecutionRole`) to only the
   services your sandbox needs before using it anywhere real.
 - **Bedrock spend.** VMs can call Bedrock freely; there's no per-user budget cap
   wired in. Add one if runaway usage is a concern.
@@ -340,23 +333,24 @@ role, plus spend controls and egress restrictions.
 ## Repo layout
 
 ```
-cdk/                 CDK app (VPC, IAM, buckets, token Lambda, CloudFront, connector)
-  bin/app.ts         entry — account/region from env
-  lib/stack.ts       the stack
-  lambda/token-vend/ token-vending Lambda (SigV4, MicroVM lifecycle)
-frontend/index.html  the xterm.js terminal + login screen
-microvm/             MicroVM image
-  Dockerfile         AL2023 + Node/Python/uv/AWS CLI/Claude Code
-  entrypoint.sh      mounts S3 Files, seeds defaults, starts terminal.js
-  terminal.js        WebSocket PTY server (ttyd protocol)
-  hooks.js           lifecycle hooks (unmount on suspend/terminate, warmup)
-  zshrc / bashrc     seeded shell config
+template.yaml         the SAM template — all AWS infrastructure
+samconfig.toml        SAM deploy defaults (stack name, capabilities)
+functions/
+  token-vend/         token-vending Lambda (SigV4, Cognito sub, MicroVM lifecycle)
+frontend/index.html   the xterm.js terminal + Cognito login screen
+microvm/              MicroVM image
+  Dockerfile          AL2023 + Node/Python/uv/AWS CLI/Claude Code
+  entrypoint.sh       starts hooks.js + terminal.js
+  hooks.js            lifecycle hooks — mounts the per-user home on /run
+  mount-home.sh       per-user S3 Files mount (-o accesspoint)
+  terminal.js         WebSocket PTY server (ttyd protocol)
+  zshrc / bashrc      seeded shell config
 scripts/
-  deploy.sh          end-to-end deploy (the one script you run)
-tools/               optional break-glass utilities for a running MicroVM
-  exec.js / exec.sh  interactive local shell into the MicroVM
-  run-remote.js      non-interactive remote command runner
-config.env.example   copy to config.env and fill in
+  deploy.sh           end-to-end deploy (SAM + frontend + image + smoke test)
+tools/                optional break-glass utilities for a running MicroVM
+  exec.js / exec.sh   interactive local shell into the MicroVM
+  run-remote.js       non-interactive remote command runner
+config.env.example    copy to config.env and fill in
 ```
 
 ---

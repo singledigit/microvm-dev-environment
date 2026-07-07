@@ -1,12 +1,10 @@
 node_modules/
-cdk/cdk.out/
-cdk/.output/
 *.DS_Store
 *.bak
 /tmp/
 
+# SAM build artifacts
+.aws-sam/
+
 # Local deployment config — never commit (your account ID, FS ID, profile, etc.)
 config.env
-
-# CDK context caches account-specific data (AZ lookups keyed by account ID)
-cdk/cdk.context.json

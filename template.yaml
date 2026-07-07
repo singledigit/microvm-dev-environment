@@ -1,0 +1,520 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  iPad Claude Code — browser terminal running Claude Code in per-user AWS Lambda
+  MicroVMs, with Cognito auth and per-user S3 Files home directories.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout of this template:
+#   Parameters  — deploy-time knobs (region-derived values, image name)
+#   Networking  — VPC, NAT, subnets, NFS security group
+#   Storage     — S3 buckets + the S3 Files filesystem/mount targets
+#   Identity    — Cognito user pool + the IAM roles
+#   Compute     — token-vending Lambda + API Gateway (Cognito-authorized)
+#   Frontend    — S3 origin + CloudFront
+#   Egress      — Lambda network connector (VPC egress for the MicroVMs)
+#   Outputs     — everything deploy.sh / the frontend need
+#
+# IAM policy precedence (per the project convention): SAM policy templates first,
+# then AWS managed policies, then inline. The token Lambda's permissions
+# (SSM write, s3files access-point CRUD, microvm lifecycle, PassRole) have no
+# matching policy template, so they are necessarily inline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+Parameters:
+  ImageName:
+    Type: String
+    Default: ipad-claude-v2
+    Description: Name of the Lambda MicroVM image (built out-of-band by deploy.sh).
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 256
+
+Resources:
+
+  # ── Networking ──────────────────────────────────────────────────────────────
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: ipad-claude-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet1 }
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet2 }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnet1 }
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnet2 }
+
+  # NFS (2049) within the VPC — S3 Files mount targets live behind this.
+  NfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS traffic for S3 Files mount targets
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.0.0.0/16
+
+  # ── Storage ─────────────────────────────────────────────────────────────────
+  # Workspace bucket backs the S3 Files filesystem (per-user home directories).
+  # Versioning is required by S3 Files. Retained so homes survive a stack delete.
+  WorkspaceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # Role S3 Files assumes to sync the bucket + manage its change-detection rules.
+  # Inline: this is a service-linked-style trust policy with no policy-template equivalent.
+  S3FilesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: elasticfilesystem.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*" }
+      Policies:
+        - PolicyName: BucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions]
+                Resource: !GetAtt WorkspaceBucket.Arn
+                Condition: { StringEquals: { aws:ResourceAccount: !Ref AWS::AccountId } }
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:List*
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "${WorkspaceBucket.Arn}/*"
+                Condition: { StringEquals: { aws:ResourceAccount: !Ref AWS::AccountId } }
+              - Effect: Allow
+                Action: [events:DeleteRule, events:DisableRule, events:EnableRule, events:PutRule, events:PutTargets, events:RemoveTargets]
+                Resource: arn:aws:events:*:*:rule/DO-NOT-DELETE-S3-Files*
+                Condition: { StringEquals: { events:ManagedBy: elasticfilesystem.amazonaws.com } }
+              - Effect: Allow
+                Action: [events:DescribeRule, events:ListRuleNamesByTarget, events:ListRules, events:ListTargetsByRule]
+                Resource: arn:aws:events:*:*:rule/*
+
+  # S3 Files filesystem (NFS over the workspace bucket) + a mount target per AZ.
+  S3FilesFileSystem:
+    Type: AWS::S3Files::FileSystem
+    Properties:
+      Bucket: !GetAtt WorkspaceBucket.Arn
+      RoleArn: !GetAtt S3FilesRole.Arn
+      AcceptBucketWarning: true
+
+  S3FilesMountTarget1:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups: [!Ref NfsSecurityGroup]
+
+  S3FilesMountTarget2:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups: [!Ref NfsSecurityGroup]
+
+  # ── Identity ────────────────────────────────────────────────────────────────
+  # Admin-created users only — no self-signup.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: ipad-claude-users
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: ipad-claude-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: hours, IdToken: hours, RefreshToken: days }
+
+  # MicroVM build role — reads the image artifact from S3.
+  # AWS managed policy for basic Lambda logging, inline for the artifact read.
+  MicroVmBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArtifactRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+
+  # MicroVM execution role — the credential the sandbox operates with.
+  # AWS managed PowerUserAccess (full service access minus IAM/Orgs), plus inline
+  # Bedrock + S3 Files client-mount permissions. See README SECURITY.
+  MicroVmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: BedrockAndS3Files
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*"
+              - Effect: Allow
+                Action: [s3files:ClientMount, s3files:ClientWrite]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource: [!GetAtt WorkspaceBucket.Arn, !Sub "${WorkspaceBucket.Arn}/*"]
+
+  # ── Compute: token-vending Lambda + API ──────────────────────────────────────
+  TokenApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowOrigin: "'*'"
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        # Do NOT gate the CORS preflight (OPTIONS) behind the authorizer — the
+        # browser sends OPTIONS without a token, so it must stay public.
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  TokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ipad-claude-token-vend
+      CodeUri: functions/token-vend/
+      Handler: index.handler
+      Environment:
+        Variables:
+          ALLOWED_ORIGINS: "*"
+          IMAGE_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}"
+          EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
+          NETWORK_CONNECTOR_ARN: !GetAtt VpcEgressConnector.Arn
+          S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
+          WORKSPACE_BUCKET_ARN: !GetAtt WorkspaceBucket.Arn
+      Policies:
+        # SAM policy templates first:
+        - SSMParameterWithSlashPrefixReadPolicy: { ParameterName: /ipad-claude/* }
+        # Then inline for permissions with no policy-template equivalent:
+        - Statement:
+            - Sid: SsmWritePerUserState
+              Effect: Allow
+              Action: [ssm:PutParameter, ssm:GetParameter]
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ipad-claude/*"
+            - Sid: PerUserAccessPoints
+              Effect: Allow
+              Action: [s3files:CreateAccessPoint, s3files:GetAccessPoint, s3files:ListAccessPoints, s3files:DeleteAccessPoint]
+              Resource: "*"
+            - Sid: MicroVmLifecycle
+              Effect: Allow
+              Action: lambda:*
+              Resource: "*"
+              Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+            - Sid: PassExecutionRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt MicroVmExecutionRole.Arn
+      Events:
+        GetToken:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TokenApi
+            Path: /token
+            Method: get
+
+  # ── Frontend: S3 + CloudFront ─────────────────────────────────────────────────
+  FrontendOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: iPad Claude Code frontend
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: frontend-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOac
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          # Managed-CachingDisabled — the frontend injects live config, don't cache it.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+
+  # Bucket policy: allow only this CloudFront distribution (via OAC) to read.
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  # ── Egress: Lambda network connector (VPC egress for MicroVMs) ────────────────
+  NetworkConnectorOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, network-connectors.lambda.amazonaws.com]
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EniManagement
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:CreateNetworkInterface
+                Resource:
+                  - arn:aws:ec2:*:*:network-interface/*
+                  - arn:aws:ec2:*:*:subnet/*
+                  - arn:aws:ec2:*:*:security-group/*
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: arn:aws:ec2:*:*:network-interface/*
+                Condition:
+                  StringEquals: { ec2:ManagedResourceOperator: network-connectors.lambda.amazonaws.com }
+
+  VpcEgressConnector:
+    Type: AWS::Lambda::NetworkConnector
+    Properties:
+      Name: ipad-claude-vpc-egress
+      Configuration:
+        VpcEgressConfiguration:
+          SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          SecurityGroupIds: [!Ref NfsSecurityGroup]
+          NetworkProtocol: IPv4
+          AssociatedComputeResourceTypes: [MicroVm]
+      OperatorRole: !GetAtt NetworkConnectorOperatorRole.Arn
+
+Outputs:
+  TokenApiUrl:
+    Description: Token-vending API endpoint.
+    Value: !Sub "https://${TokenApi}.execute-api.${AWS::Region}.amazonaws.com/prod/token"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  FrontendUrl:
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  WorkspaceBucketName:
+    Value: !Ref WorkspaceBucket
+  CloudFrontDistributionId:
+    Value: !Ref FrontendDistribution
+  BuildRoleArn:
+    Value: !GetAtt MicroVmBuildRole.Arn
+  ExecutionRoleArn:
+    Value: !GetAtt MicroVmExecutionRole.Arn
+  NetworkConnectorArn:
+    Value: !GetAtt VpcEgressConnector.Arn
+  S3FilesFileSystemId:
+    Value: !GetAtt S3FilesFileSystem.FileSystemId

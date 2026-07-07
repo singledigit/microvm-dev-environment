@@ -1,0 +1,16 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "ipad-claude"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3 = true
+region = "us-east-1"
+# Auth is Cognito; no shared secrets in params. ImageName can be overridden:
+#   sam deploy --parameter-overrides ImageName=my-image
