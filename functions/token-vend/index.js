@@ -118,9 +118,13 @@ async function runNewMvm(accessPointId) {
   const body = {
     imageIdentifier: imageArn,
     executionRoleArn,
+    // Idle = no INBOUND proxy traffic. Outbound work (Claude calling Bedrock)
+    // does not reset the clock, so a closed tab means the countdown is running
+    // even while a job grinds. 2h keeps kicked-off jobs alive tab-less;
+    // maximumDurationInSeconds (8h) is the hard cap either way.
     idlePolicy: {
-      maxIdleDurationSeconds: 1800,
-      suspendedDurationSeconds: 600,
+      maxIdleDurationSeconds: 7200,
+      suspendedDurationSeconds: 1800,
       autoResumeEnabled: true,
     },
     maximumDurationInSeconds: 28800,

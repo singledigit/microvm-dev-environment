@@ -127,16 +127,57 @@ EOF
 RUN echo '{"permissions":{"defaultMode":"bypassPermissions"}}' \
     > /etc/skel-coder/.claude/settings.json
 
-# WebFetch/WebSearch domain verification (claude.ai) is unreachable from the MVM
-# network, so those tools always fail — steer Claude to curl via Bash instead.
+# Environment briefing for the in-VM Claude: where it runs, what persists, and
+# the local gotchas (NFS hardlinks, WebFetch, IAM scope, lifecycle). Refreshed
+# into /home/coder on every mount by mount-home.sh, not just first seed, so
+# updates reach existing users.
 RUN cat > /etc/skel-coder/.claude/CLAUDE.md <<'EOF'
-# Sandbox environment notes
+# Your environment: a personal cloud sandbox VM
 
-- The WebFetch and WebSearch tools do not work in this sandbox: their domain-safety
-  verification endpoint (claude.ai) is blocked from this network, so every fetch is
-  rejected as "unverifiable" even though the target site is reachable.
-- Outbound network access from Bash is fully open. To fetch web content, use curl
-  instead, e.g.: curl -s "https://example.com"  or  curl -s "wttr.in/London?format=3"
+You are running inside a dedicated AWS Lambda MicroVM (Firecracker-isolated,
+Amazon Linux 2023, aarch64, 8 GB RAM) that belongs entirely to this user and
+is reached through a browser terminal. Act accordingly: you have far more
+freedom here than in a typical local checkout, and different persistence rules.
+
+## What you can do freely
+- Full shell as `coder` with passwordless sudo. Installing packages (dnf, npm,
+  pip), running servers, compiling, long builds — all fine, no approval needed.
+- Outbound network from Bash is fully open (curl, git clone, package registries).
+- This VM is isolated per user: nothing you run here can affect other users.
+
+## What persists (and what does not)
+- ONLY `/home/coder` persists. It is an NFS mount backed by Amazon S3, scoped
+  to this user, and it survives VM restarts and recycles.
+- Everything else — `sudo dnf install`, `npm install -g`, system config — is on
+  the VM image and resets when the VM is recycled. If the user needs a tool
+  long-term, install it into the home directory or add the install command to
+  `~/.zshrc` so it self-heals on a fresh VM.
+- The home filesystem rejects hardlinks (EMLINK). Tools that depend on them
+  should keep caches/state outside home: uv is already configured for /opt/uv;
+  point similar tools at /tmp or /opt if they fail oddly in $HOME.
+
+## Credentials and AWS access
+- There are no API keys anywhere. AWS access comes from the VM's IAM execution
+  role via IMDSv2. You (Claude Code) run through Amazon Bedrock using that role.
+- The role is intentionally narrow: Bedrock model invocation + the S3 Files
+  home mount. `aws sts get-caller-identity` works, but do not expect broad AWS
+  permissions — if the user wants to manage AWS resources, they should provide
+  scoped credentials themselves.
+
+## VM lifecycle — checkpoint long work
+- Idle is measured by INBOUND browser traffic only. If the user closes the tab,
+  the VM suspends after ~2 hours (your process freezes mid-instruction and
+  resumes later; in-flight network calls will have died — just retry). A VM
+  lives at most 8 hours, then terminates.
+- Therefore: for long-running jobs, write progress and results to files under
+  /home/coder as you go. Files survive termination; your session does not.
+
+## Tool quirks
+- WebFetch and WebSearch do not work here: their domain-safety verification
+  endpoint (claude.ai) is blocked from this network, so every fetch is rejected
+  as "unverifiable" even though the target site is reachable.
+- Use curl via Bash instead, e.g.: curl -s "https://example.com"  or
+  curl -s "wttr.in/London?format=3"
 EOF
 
 # Bedrock — uses execution role via IMDSv2

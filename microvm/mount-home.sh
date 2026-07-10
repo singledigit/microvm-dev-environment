@@ -51,6 +51,14 @@ for attempt in 1 2 3 4 5 6; do
       done
       echo "mount-home: seed complete" >> /tmp/hooks.log
     fi
+    # The environment briefing is image-owned, not user-owned: refresh it on
+    # EVERY mount (not just first seed) so image updates reach existing homes.
+    if [ -f "$SKEL/.claude/CLAUDE.md" ]; then
+      mkdir -p "$MOUNT_PATH/.claude" 2>>/tmp/hooks.log || true
+      cp "$SKEL/.claude/CLAUDE.md" "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
+        && chown 1000:1000 "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
+        || echo "mount-home: CLAUDE.md refresh failed" >> /tmp/hooks.log
+    fi
     MOUNTED=true
     break
   fi
