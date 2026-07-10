@@ -13,8 +13,18 @@ RUN dnf install -y \
     zsh \
     amazon-efs-utils \
     python3-pip \
-    && dnf clean all \
-    && pip3 install botocore
+    && dnf clean all
+
+# Disable efs-utils/efs-proxy CloudWatch telemetry (mount attempts + proxy
+# metrics). It cannot work here anyway — mount.s3files runs under python3.13
+# (no botocore; installing it would put a ~90MB cold import on the mount's
+# critical path), and efs-proxy derives a log-stream name that fails
+# CloudWatch's own [^:*]* validation — so every mount logged two spurious
+# errors. Mount diagnostics remain in /var/log/amazon/efs/ inside the VM.
+RUN sed -i '/^\[cloudwatch-log\]/,/^\[/ s/^enabled = true/enabled = false/' \
+      /etc/amazon/efs/s3files-utils.conf /etc/amazon/efs/efs-utils.conf \
+    && sed -i 's/^metrics_enabled = true/metrics_enabled = false/' \
+      /etc/amazon/efs/s3files-utils.conf
 
 # Node.js (latest LTS via NodeSource)
 RUN curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - \

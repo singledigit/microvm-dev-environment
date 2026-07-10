@@ -29,6 +29,20 @@ let prefetchStarted = false;
 function prefetchDisk() {
   if (prefetchStarted) return;
   prefetchStarted = true;
+  // Wait for the home mount to finish first: demand-paging from snapshot
+  // storage is bandwidth-limited (~3MB/s first touch), and the mount is the
+  // user-blocking path — warmup running concurrently starves the mount's own
+  // page-ins and adds 10s+ to time-to-shell. 60s cap so a failed mount can't
+  // block warmup forever.
+  const waitStart = Date.now();
+  const iv = setInterval(() => {
+    if (!fs.existsSync('/tmp/home-ready') && Date.now() - waitStart < 60000) return;
+    clearInterval(iv);
+    runWarmup();
+  }, 250);
+}
+
+function runWarmup() {
   // Warm exactly the pages a Claude session touches by executing the real
   // startup path once. Demand-paging from snapshot storage is slow (~3MB/s
   // first touch) and bandwidth-limited, so a broad find|cat prefetch competes
@@ -37,6 +51,7 @@ function prefetchDisk() {
   const child = spawn('/bin/sh', ['-c', [
     'sudo -u coder HOME=/home/coder claude --version',
     'bash -lc true',            // login-shell path: bash, profile, coreutils
+    'zsh -lc true || true',     // the terminal's actual login shell
     'git --version',
     'echo "warmup done" >> /tmp/hooks.log',
   ].join('; ')], { detached: true, stdio: 'ignore' });

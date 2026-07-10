@@ -24,6 +24,55 @@ if [ -d "$CLI_DIR" ] && ! mountpoint -q "$CLI_DIR" 2>/dev/null; then
   fi
 fi
 
+# Same disease, same cure for the S3 Files mount stack: mount.s3files is a
+# Python script, so the first mount on a fresh VM demand-pages python3.13
+# (~67MB interpreter+stdlib) plus the 24MB efs-proxy from snapshot storage at
+# ~3MB/s — measured 15-30s of the mount's wall clock. Copy the stack into
+# tmpfs and bind it over the originals so it rides the memory snapshot and the
+# /run-hook mount starts executing instantly. node is here because hooks.js /
+# terminal.js run on it and even a RUNNING process's file-backed text pages
+# are dropped at snapshot capture — the hook server itself demand-pages node
+# on resume. Per-file failures are non-fatal: an unbound path just stays on
+# disk (slow but correct).
+WARM=/opt/warm-mount-stack
+MOUNT_STACK=(
+  /usr/lib64/python3.13
+  /usr/lib/python3.13
+  /usr/lib64/libpython3.13.so.1.0
+  /usr/bin/python3.13
+  /usr/lib64/libssl.so.3
+  /usr/lib64/libcrypto.so.3
+  /usr/sbin/efs-proxy
+  /usr/sbin/efs_utils_common
+  /usr/sbin/mount_s3files
+  /usr/sbin/mount.s3files
+  /usr/sbin/mount.nfs
+  /etc/amazon/efs
+  /usr/bin/node
+  /usr/bin/bash
+  /usr/bin/mount
+  /usr/bin/mountpoint
+)
+if ! mountpoint -q "$WARM" 2>/dev/null; then
+  mkdir -p "$WARM"
+  if mount -t tmpfs -o size=320m,mode=0755 tmpfs "$WARM"; then
+    for src in "${MOUNT_STACK[@]}"; do
+      real=$(readlink -f "$src")            # bind the target, not the symlink
+      [ -e "$real" ] || continue
+      dst="$WARM/$(echo "$real" | tr / _)"  # unique name per path (two python3.13 dirs)
+      if cp -a "$real" "$dst" 2>/dev/null && mount --bind "$dst" "$real" 2>/dev/null; then
+        :
+      else
+        echo "mount-stack warm: $real stays on disk" >> /tmp/hooks.log
+      fi
+    done
+    echo "mount stack relocated to tmpfs" >> /tmp/hooks.log
+  else
+    rmdir "$WARM" 2>/dev/null || true
+    echo "mount-stack tmpfs failed — mount stack stays on disk" >> /tmp/hooks.log
+  fi
+fi
+
 # Start the lifecycle hooks server. It performs the per-user S3 Files mount on
 # the /run and /resume hooks (NOT here): the image snapshot is shared across
 # all VMs, so the mount can't be baked in at build time — each VM mounts its
