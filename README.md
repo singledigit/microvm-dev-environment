@@ -17,32 +17,25 @@ tools are still there.
 ## How it works
 
 ```mermaid
-flowchart LR
-    subgraph browser["Browser (iPad / desktop)"]
-        UI["xterm.js terminal<br/>+ login screen"]
-    end
+flowchart TD
+    UI["Browser<br/>(xterm.js terminal)"]
 
     CF["CloudFront"]
-    S3F["S3 (frontend/index.html)"]
-    COG["Cognito User Pool<br/>(admin-created users)"]
-    APIGW["API Gateway<br/>(Cognito authorizer)<br/>→ token Lambda"]
+    COG["Cognito<br/>(User Pool)"]
+    APIGW["API Gateway<br/>(Cognito Authorizer)"]
+    TOKENFN["Token Lambda<br/>(find/create home,<br/>launch/resume VM,<br/>mint auth token)"]
+    MVM["Per-User MicroVM<br/>(Claude Code + zsh)"]
+    S3FILES[("S3 Files<br/>(/home/coder)<br/>per-user access point")]
 
-    subgraph mvm["Per-user Lambda MicroVM"]
-        TERM["terminal.js — PTY :8080<br/>zsh → claude (Bedrock)"]
-        HOME["/home/coder"]
-    end
-
-    S3FILES["S3 Files access point<br/>/users/&lt;sub&gt; (persistent home)"]
-
-    S3F -. served by .-> CF
-    CF -->|loads app| UI
-    UI -->|"sign in (password)"| COG
-    COG -->|JWT| UI
-    UI -->|"HTTPS: Bearer JWT"| APIGW
-    APIGW -->|"validates JWT, then<br/>{ token, endpoint }"| UI
-    UI ==>|"WebSocket (wss, ttyd protocol)<br/>auth via subprotocol"| TERM
-    APIGW -. "launches this user's VM,<br/>mints token" .-> mvm
-    HOME <-->|"NFS mount<br/>(-o accesspoint)"| S3FILES
+    UI -->|HTTPS| CF
+    CF -.->|static frontend| UI
+    UI -->|sign in| COG
+    COG -.->|JWT| UI
+    UI -->|"GET /token (JWT in header)"| APIGW
+    APIGW -->|validated identity| TOKENFN
+    TOKENFN -.->|"{ authToken, endpoint }"| UI
+    UI -->|"WebSocket (wss)<br/>subprotocol auth"| MVM
+    MVM -->|"mount (lifecycle hook)"| S3FILES
 ```
 
 - **Frontend** — a single `index.html` (xterm.js) on S3, served via CloudFront.
