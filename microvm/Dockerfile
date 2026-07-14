@@ -164,10 +164,28 @@ freedom here than in a typical local checkout, and different persistence rules.
 ## Credentials and AWS access
 - There are no API keys anywhere. AWS access comes from the VM's IAM execution
   role via IMDSv2. You (Claude Code) run through Amazon Bedrock using that role.
-- The role is intentionally narrow: Bedrock model invocation + the S3 Files
-  home mount. `aws sts get-caller-identity` works, but do not expect broad AWS
-  permissions — if the user wants to manage AWS resources, they should provide
-  scoped credentials themselves.
+- The role is broad by design: PowerUserAccess (full access to AWS services)
+  plus scoped IAM writes so you can deploy real stacks — `sam deploy`, CDK,
+  CloudFormation with role creation all work. The guardrail is a permissions
+  boundary: **any IAM role you create MUST carry the permissions boundary
+  `arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary`** (get the
+  account id from `aws sts get-caller-identity`), or the CreateRole call is
+  denied with AccessDenied. How to attach it:
+  - SAM: add to template.yaml — `Globals: { Function: { PermissionsBoundary:
+    arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary } }`, or
+    per-role via the role's `PermissionsBoundary` property.
+  - CDK: `new iam.Role(..., { permissionsBoundary: ManagedPolicy.fromManagedPolicyArn(...) })`
+    or the `@aws-cdk/core:permissionsBoundary` context key.
+  - CLI: `aws iam create-role --permissions-boundary <that-arn> ...`
+  If a deploy fails with AccessDenied on iam:CreateRole, the missing boundary
+  is almost always why — fix the template, don't retry blindly.
+- Hard limits (by design, do not try to work around them): no IAM users or
+  access keys, no editing/removing the boundary itself, no touching the
+  sandbox's own `ipad-claude-*` roles, and roles you create are capped at
+  this sandbox's own privilege level.
+- With great power: this role is shared across every user's VM and is billed
+  to the sandbox owner's account. Create resources deliberately, prefer
+  tagging what you create, and clean up experiments when done.
 
 ## VM lifecycle — checkpoint long work
 - Idle is measured by INBOUND browser traffic only. If the user closes the tab,

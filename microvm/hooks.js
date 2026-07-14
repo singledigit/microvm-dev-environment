@@ -53,6 +53,17 @@ function runWarmup() {
     'bash -lc true',            // login-shell path: bash, profile, coreutils
     'zsh -lc true || true',     // the terminal's actual login shell
     'git --version',
+    // Page in the uvx-launched AWS MCP proxy so the first Claude session's
+    // MCP connect doesn't demand-page /opt/uv cold and risk timing out.
+    // The version is parsed from the plugin's own .mcp.json (the file that
+    // actually launches it) so the warm can never drift from reality; the
+    // plugin cache lives in the user home, hence after the mount. No match
+    // (plugin not installed / path moved) → skip, never fail the warmup.
+    'V=$(grep -ho "mcp-proxy-for-aws@[0-9.]*" /home/coder/.claude/plugins/cache/*/*/*/.mcp.json 2>/dev/null | head -1); ' +
+      '[ -n "$V" ] && sudo -u coder HOME=/home/coder ' +
+      'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
+      'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
+      'uvx "$V" --help >/dev/null 2>&1 || true',
     'echo "warmup done" >> /tmp/hooks.log',
   ].join('; ')], { detached: true, stdio: 'ignore' });
   child.unref();

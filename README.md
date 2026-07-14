@@ -335,12 +335,18 @@ a few things still warrant care before you point it at anything sensitive:
   passwordless `sudo` **inside their own VM** — fine, since the VM and home are
   per-user, but it does mean a user is root within their own sandbox.
 - **Broad AWS privileges — the main thing to scope.** The MicroVM runs as
-  `MicroVmExecutionRole`, which has **`PowerUserAccess`** — full access to AWS
-  services *except* IAM and Organizations management. Anything Claude (or the
-  user) runs in the terminal can use those credentials, resolved automatically
-  from the instance role via IMDS, **and every user's VM shares this one role**.
-  Scope it down in `template.yaml` (`MicroVmExecutionRole`) to only the
-  services your sandbox needs before using it anywhere real.
+  `MicroVmExecutionRole`: **`PowerUserAccess`** (full access to AWS services)
+  **plus boundary-gated IAM writes** so full-stack deploys (`sam deploy`, CDK)
+  work from inside the sandbox. The escalation guardrail is a permissions
+  boundary (`SandboxPermissionsBoundary`): every role created from the sandbox
+  must carry it, it caps those roles at the sandbox's own privilege level, and
+  it self-propagates to roles *they* create. IAM users/access keys are never
+  grantable, the boundary itself can't be edited or detached, and the
+  sandbox's own `ipad-claude-*` roles are off-limits. Anything Claude (or the
+  user) runs in the terminal wields these credentials (resolved from the
+  instance role via IMDS), **and every user's VM shares this one role**.
+  Scope `MicroVmExecutionRole` down in `template.yaml` to only the services
+  your sandbox needs before using it anywhere real.
 - **Bedrock spend.** VMs can call Bedrock freely; there's no per-user budget cap
   wired in. Add one if runaway usage is a concern.
 - **No network isolation of the workload.** MicroVMs have open outbound internet
@@ -349,6 +355,55 @@ a few things still warrant care before you point it at anything sensitive:
 For a production multi-tenant deployment you'd additionally want a per-user
 (or per-tenant) scoped execution role rather than one shared `PowerUserAccess`
 role, plus spend controls and egress restrictions.
+
+### Deploying from inside the sandbox
+
+The sandbox can run full-stack deploys (`sam deploy`, CDK, CloudFormation)
+including role creation — with one requirement: **every IAM role created from
+inside the sandbox must carry the permissions boundary**
+
+```
+arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
+```
+
+(get the account id from `aws sts get-caller-identity`). A `CreateRole`
+without it is denied — if a deploy fails with `AccessDenied` on
+`iam:CreateRole`, a missing boundary is almost always why. How to attach it:
+
+- **SAM** — all function roles at once, in `template.yaml`:
+
+  ```yaml
+  Globals:
+    Function:
+      PermissionsBoundary: arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
+  ```
+
+  or per-role via the `PermissionsBoundary` property on `AWS::IAM::Role`.
+
+- **CDK** — apply it to the whole app so every construct-created role gets it:
+
+  ```json
+  // cdk.json
+  { "context": { "@aws-cdk/core:permissionsBoundary": {
+      "name": "ipad-claude-sandbox-boundary" } } }
+  ```
+
+  or per-role: `new iam.Role(..., { permissionsBoundary:
+  iam.ManagedPolicy.fromManagedPolicyName(this, 'Pb', 'ipad-claude-sandbox-boundary') })`.
+
+- **CLI** —
+
+  ```bash
+  aws iam create-role --role-name my-role \
+    --permissions-boundary arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary \
+    --assume-role-policy-document file://trust.json
+  ```
+
+The boundary caps created roles at the sandbox's own privilege level and
+propagates itself: roles created from the sandbox can create further roles,
+but only ones carrying the same boundary. The in-VM `CLAUDE.md` briefing
+carries these same instructions, so Claude inside the sandbox handles this
+automatically.
 
 ---
 

@@ -312,9 +312,75 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt ArtifactBucket.Arn
 
+  # Permissions boundary for roles created FROM INSIDE the sandbox. The
+  # execution role may create/manage IAM roles only if the new role carries
+  # this boundary, and the boundary caps every such role at sandbox level —
+  # so the sandbox can deploy full stacks (SAM/CDK role creation included)
+  # but can never mint anything more privileged than itself, create IAM
+  # users/access keys, or tamper with the boundary. The statements here
+  # deliberately mirror the execution role's ScopedIamWrites policy so that
+  # roles created by created roles are capped identically (self-propagating).
+  # Name is fixed (not stack-derived) because the in-VM CLAUDE.md briefing
+  # must be able to state the ARN statically — repo convention, same as the
+  # hardcoded /ipad-claude/* SSM prefix and function name.
+  SandboxPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: ipad-claude-sandbox-boundary
+      Description: Caps IAM roles created from inside the sandbox at sandbox privilege level.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Broad service access, PowerUserAccess-shaped.
+          - Sid: Services
+            Effect: Allow
+            NotAction: [iam:*, organizations:*, account:*]
+            Resource: "*"
+          - Sid: IamRead
+            Effect: Allow
+            Action: [iam:Get*, iam:List*, iam:SimulatePrincipalPolicy, iam:SimulateCustomPolicy]
+            Resource: "*"
+          - Sid: PassRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+          - Sid: BoundedRoleWrites
+            Effect: Allow
+            Action: [iam:CreateRole, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:PutRolePermissionsBoundary]
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+            Condition:
+              StringEquals:
+                iam:PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
+          - Sid: RoleLifecycle
+            Effect: Allow
+            Action: [iam:DeleteRole, iam:UpdateRole, iam:UpdateRoleDescription, iam:UpdateAssumeRolePolicy, iam:TagRole, iam:UntagRole, iam:CreateServiceLinkedRole]
+            Resource: "*"
+          - Sid: ManagePolicies
+            Effect: Allow
+            Action: [iam:CreatePolicy, iam:DeletePolicy, iam:CreatePolicyVersion, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion, iam:TagPolicy, iam:UntagPolicy]
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
+          - Sid: InstanceProfiles
+            Effect: Allow
+            Action: [iam:CreateInstanceProfile, iam:DeleteInstanceProfile, iam:AddRoleToInstanceProfile, iam:RemoveRoleFromInstanceProfile, iam:TagInstanceProfile, iam:UntagInstanceProfile]
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/*"
+          - Sid: DenyBoundaryTamper
+            Effect: Deny
+            Action: [iam:CreatePolicyVersion, iam:DeletePolicy, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion]
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
+          - Sid: DenyBoundaryRemoval
+            Effect: Deny
+            Action: iam:DeleteRolePermissionsBoundary
+            Resource: "*"
+          - Sid: DenyTouchSandboxInfra
+            Effect: Deny
+            Action: iam:*
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
+
   # MicroVM execution role — the credential the sandbox operates with.
-  # AWS managed PowerUserAccess (full service access minus IAM/Orgs), plus inline
-  # Bedrock + S3 Files client-mount permissions. See README SECURITY.
+  # AWS managed PowerUserAccess (full service access minus IAM/Orgs), plus
+  # inline Bedrock + S3 Files client-mount permissions, plus boundary-gated
+  # IAM writes (ScopedIamWrites) so `sam deploy` / CDK work from inside the
+  # sandbox without granting open-ended IAM. See README SECURITY.
   MicroVmExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -351,6 +417,56 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:ListBucket]
                 Resource: [!GetAtt WorkspaceBucket.Arn, !Sub "${WorkspaceBucket.Arn}/*"]
+        # IAM writes for in-sandbox deploys (sam deploy, CDK, etc.), gated by
+        # the permissions boundary: any role created from the sandbox MUST
+        # carry SandboxPermissionsBoundary, which caps it at sandbox level and
+        # propagates the same cap to roles it creates in turn. Escalation
+        # paths are closed: no boundary-free role writes, no IAM users or
+        # access keys (never granted), no editing/removing the boundary, no
+        # touching the sandbox's own ipad-claude-* roles.
+        - PolicyName: ScopedIamWrites
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: IamRead
+                Effect: Allow
+                Action: [iam:Get*, iam:List*, iam:SimulatePrincipalPolicy, iam:SimulateCustomPolicy]
+                Resource: "*"
+              - Sid: PassRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+              - Sid: BoundedRoleWrites
+                Effect: Allow
+                Action: [iam:CreateRole, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:PutRolePermissionsBoundary]
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref SandboxPermissionsBoundary
+              - Sid: RoleLifecycle
+                Effect: Allow
+                Action: [iam:DeleteRole, iam:UpdateRole, iam:UpdateRoleDescription, iam:UpdateAssumeRolePolicy, iam:TagRole, iam:UntagRole, iam:CreateServiceLinkedRole]
+                Resource: "*"
+              - Sid: ManagePolicies
+                Effect: Allow
+                Action: [iam:CreatePolicy, iam:DeletePolicy, iam:CreatePolicyVersion, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion, iam:TagPolicy, iam:UntagPolicy]
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
+              - Sid: InstanceProfiles
+                Effect: Allow
+                Action: [iam:CreateInstanceProfile, iam:DeleteInstanceProfile, iam:AddRoleToInstanceProfile, iam:RemoveRoleFromInstanceProfile, iam:TagInstanceProfile, iam:UntagInstanceProfile]
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/*"
+              - Sid: DenyBoundaryTamper
+                Effect: Deny
+                Action: [iam:CreatePolicyVersion, iam:DeletePolicy, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion]
+                Resource: !Ref SandboxPermissionsBoundary
+              - Sid: DenyBoundaryRemoval
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: "*"
+              - Sid: DenyTouchSandboxInfra
+                Effect: Deny
+                Action: iam:*
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
 
   # ── Compute: token-vending Lambda + API ──────────────────────────────────────
   TokenApi:
