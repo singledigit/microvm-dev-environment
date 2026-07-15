@@ -2,7 +2,8 @@
 // and /resume), not in entrypoint.sh: the image snapshot is shared across all
 // VMs, so the mount can't be baked in at build time — each VM mounts its own
 // user's access point at run time, and the access-point id arrives in the /run
-// payload. Also handles suspend/terminate unmount and a startup disk prefetch.
+// payload. Also handles suspend/terminate unmount and the /validate image
+// hook, which drives the platform's page prefetch (the cold-start fix).
 const http = require('http');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
@@ -26,49 +27,31 @@ function mountHome(accessPointId) {
   console.log(`mountHome launched (accesspoint=${accessPointId || 'none'})`);
 }
 
-let prefetchStarted = false;
-function prefetchDisk() {
-  if (prefetchStarted) return;
-  prefetchStarted = true;
-  // Wait for the home mount to finish first: demand-paging from snapshot
-  // storage is bandwidth-limited (~3MB/s first touch), and the mount is the
-  // user-blocking path — warmup running concurrently starves the mount's own
-  // page-ins and adds 10s+ to time-to-shell. 60s cap so a failed mount can't
-  // block warmup forever.
+// Pre-warm the uvx-launched AWS MCP proxy so the first Claude session's MCP
+// connect doesn't hit a cold uv cache and risk timing out. The version is
+// parsed from the plugin's own .mcp.json (the file that actually launches
+// it) so the warm can never drift from reality. The plugin cache lives in
+// the user home, so this waits for the mount's ready marker (60s cap so a
+// failed mount can't wedge it). No match (plugin not installed) → skip.
+let mcpWarmStarted = false;
+function warmMcpProxy() {
+  if (mcpWarmStarted) return;
+  mcpWarmStarted = true;
   const waitStart = Date.now();
   const iv = setInterval(() => {
     if (!fs.existsSync('/tmp/home-ready') && Date.now() - waitStart < 60000) return;
     clearInterval(iv);
-    runWarmup();
+    const child = spawn('/bin/sh', ['-c',
+      'V=$(grep -ho "mcp-proxy-for-aws@[0-9.]*" /home/coder/.claude/plugins/cache/*/*/*/.mcp.json 2>/dev/null | head -1); ' +
+        '[ -n "$V" ] && sudo -u coder HOME=/home/coder ' +
+        'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
+        'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
+        'uvx "$V" --help >/dev/null 2>&1; ' +
+        'echo "mcp warm done" >> /tmp/hooks.log'
+    ], { detached: true, stdio: 'ignore' });
+    child.unref();
+    console.log('MCP proxy warm launched');
   }, 250);
-}
-
-function runWarmup() {
-  // Warm exactly the pages a Claude session touches by executing the real
-  // startup path once. Demand-paging from snapshot storage is slow (~3MB/s
-  // first touch) and bandwidth-limited, so a broad find|cat prefetch competes
-  // with the user's own first launch and makes it WORSE — running the actual
-  // binary is both targeted and finishes in seconds.
-  const child = spawn('/bin/sh', ['-c', [
-    'sudo -u coder HOME=/home/coder claude --version',
-    'bash -lc true',            // login-shell path: bash, profile, coreutils
-    'zsh -lc true || true',     // the terminal's actual login shell
-    'git --version',
-    // Page in the uvx-launched AWS MCP proxy so the first Claude session's
-    // MCP connect doesn't demand-page /opt/uv cold and risk timing out.
-    // The version is parsed from the plugin's own .mcp.json (the file that
-    // actually launches it) so the warm can never drift from reality; the
-    // plugin cache lives in the user home, hence after the mount. No match
-    // (plugin not installed / path moved) → skip, never fail the warmup.
-    'V=$(grep -ho "mcp-proxy-for-aws@[0-9.]*" /home/coder/.claude/plugins/cache/*/*/*/.mcp.json 2>/dev/null | head -1); ' +
-      '[ -n "$V" ] && sudo -u coder HOME=/home/coder ' +
-      'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
-      'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
-      'uvx "$V" --help >/dev/null 2>&1 || true',
-    'echo "warmup done" >> /tmp/hooks.log',
-  ].join('; ')], { detached: true, stdio: 'ignore' });
-  child.unref();
-  console.log('Startup warmup launched');
 }
 
 function unmountHome() {
@@ -117,6 +100,17 @@ const server = http.createServer((req, res) => {
         // belt-and-suspenders: read the big binaries end to end for sampling
         'cat /usr/sbin/efs-proxy /usr/bin/node /usr/bin/mount /usr/sbin/mount.nfs > /dev/null 2>&1 || true',
         '/usr/bin/python3.13 -c "import subprocess,ssl,json" || true',
+        // the uv cache holds the pre-warmed AWS MCP proxy package (Dockerfile);
+        // a session's first MCP connect launches it via uvx, so RUN the real
+        // command — paging uv's python, extraction, and env-assembly paths
+        // that a byte-level sweep of the cache files would miss. Version must
+        // match the Dockerfile pre-warm (no user home at validate time to
+        // parse the plugin config from).
+        'sudo -u coder HOME=/home/coder ' +
+          'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
+          'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
+          'timeout 60 uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 || true',
+        'find /opt/uv -type f -exec cat {} + > /dev/null 2>&1 || true',
         'touch /tmp/validate-done',
       ].join('; ')], { detached: true, stdio: 'ignore' });
       child.unref();
@@ -177,11 +171,7 @@ const server = http.createServer((req, res) => {
       // Answer fast; the mount runs in the background (see mountHome).
       res.writeHead(200); res.end();
       mountHome(accessPointId);
-      // Warm the demand-paged disk paths a Claude session needs (CLI bundle,
-      // shared libs, coreutils) once per boot. The /validate hook taught the
-      // platform to prefetch these; this warmup is the second layer that
-      // faults them in before the user's first keystroke needs them.
-      if (url === `${BASE}/run`) prefetchDisk();
+      if (url === `${BASE}/run`) warmMcpProxy();
     });
     return;
   }

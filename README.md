@@ -195,7 +195,7 @@ aws s3 cp /tmp/ipad-claude-microvm.zip "s3://$ARTIFACT_BUCKET/ipad-claude-microv
 #     which disk pages the app touches while /validate runs and prefetches
 #     them on future launches — hooks.js exercises the full startup path
 #     (mount toolchain + Claude CLI) there, cutting first-mount from ~26s to
-#     a few seconds and first `claude` launch to sub-second.
+#     a few seconds and first `claude` launch from 60-90s to a second or two.
 aws lambda-microvms create-microvm-image \
   --name "$IMAGE_NAME" \
   --base-image-arn "arn:aws:lambda:$AWS_REGION:aws:microvm-image:al2023-1" \
