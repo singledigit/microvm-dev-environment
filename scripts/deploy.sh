@@ -145,7 +145,9 @@ if [ "$SKIP_IMAGE" = false ]; then
       \"port\": 9000,
       \"microvmImageHooks\": {
         \"ready\": \"ENABLED\",
-        \"readyTimeoutInSeconds\": 180
+        \"readyTimeoutInSeconds\": 180,
+        \"validate\": \"ENABLED\",
+        \"validateTimeoutInSeconds\": 300
       },
       \"microvmHooks\": {
         \"run\":                    \"ENABLED\",

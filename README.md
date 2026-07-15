@@ -190,14 +190,19 @@ aws s3 cp /tmp/ipad-claude-microvm.zip "s3://$ARTIFACT_BUCKET/ipad-claude-microv
 
 # 3b. Create the MicroVM image. --additional-os-capabilities '["ALL"]' grants
 #     CAP_SYS_ADMIN (needed to mount S3 Files) and ONLY applies at create time.
-#     Hooks let the app mount/unmount around lifecycle transitions.
+#     Hooks let the app mount/unmount around lifecycle transitions. The
+#     `validate` image hook matters for cold-start speed: the platform samples
+#     which disk pages the app touches while /validate runs and prefetches
+#     them on future launches — hooks.js exercises the full startup path
+#     (mount toolchain + Claude CLI) there, cutting first-mount from ~26s to
+#     a few seconds and first `claude` launch to sub-second.
 aws lambda-microvms create-microvm-image \
   --name "$IMAGE_NAME" \
   --base-image-arn "arn:aws:lambda:$AWS_REGION:aws:microvm-image:al2023-1" \
   --build-role-arn "$BUILD_ROLE" \
   --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/ipad-claude-microvm.zip\"}" \
   --additional-os-capabilities '["ALL"]' \
-  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}' \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180,"validate":"ENABLED","validateTimeoutInSeconds":300},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}' \
   --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION"
 
@@ -411,7 +416,8 @@ frontend/index.html   the xterm.js terminal + Cognito login screen
 microvm/              MicroVM image
   Dockerfile          AL2023 + Node/Python/uv/AWS CLI/Claude Code
   entrypoint.sh       starts hooks.js + terminal.js
-  hooks.js            lifecycle hooks — mounts the per-user home on /run
+  hooks.js            lifecycle hooks — mounts the per-user home on /run;
+                      /validate exercises the cold path for platform prefetch
   mount-home.sh       per-user S3 Files mount (-o accesspoint)
   terminal.js         WebSocket PTY server (ttyd protocol)
   zshrc / bashrc      seeded shell config

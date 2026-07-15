@@ -11,6 +11,7 @@ const BASE = '/aws/lambda-microvms/runtime/v1';
 const MOUNT_PATH = '/home/coder';
 const AP_FILE = '/tmp/access-point-id';
 let appReady = false;
+let validateStarted = false;
 
 setTimeout(() => { appReady = true; }, 5000);
 
@@ -93,6 +94,39 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url === `${BASE}/validate` && method === 'POST') {
+    // Build-time validate run: the platform boots a test VM from the fresh
+    // snapshot and SAMPLES which disk pages get touched while this hook runs,
+    // then prefetches those pages on future launches. So: touch exactly what
+    // a real session's cold path needs. Crucially that includes the S3 Files
+    // mount toolchain — a validate-time VM gets no runHookPayload, so the
+    // per-user mount never runs on its own and the mount stack would never
+    // be sampled unless we exercise it here deliberately.
+    // Contract: 503 while working, 200 when done (platform polls).
+    if (!validateStarted) {
+      validateStarted = true;
+      const child = spawn('/bin/sh', ['-c', [
+        // the real session cold path
+        'sudo -u coder HOME=/home/coder claude --version',
+        'bash -lc true', 'zsh -lc true || true', 'git --version',
+        // the mount toolchain: a REAL mount attempt (bogus access point, so it
+        // fails after exercising python3.13, the helpers, and efs-proxy — the
+        // failure is the point, the page-touches are what get sampled)
+        'mkdir -p /mnt/validate-test',
+        'timeout 25 mount -t s3files -o "accesspoint=fsap-0000000000000000f" "$S3_FILES_FS_ID" /mnt/validate-test >/dev/null 2>&1 || true',
+        // belt-and-suspenders: read the big binaries end to end for sampling
+        'cat /usr/sbin/efs-proxy /usr/bin/node /usr/bin/mount /usr/sbin/mount.nfs > /dev/null 2>&1 || true',
+        '/usr/bin/python3.13 -c "import subprocess,ssl,json" || true',
+        'touch /tmp/validate-done',
+      ].join('; ')], { detached: true, stdio: 'ignore' });
+      child.unref();
+      console.log('Validate workload launched');
+    }
+    if (fs.existsSync('/tmp/validate-done')) { res.writeHead(200); res.end(); }
+    else { res.writeHead(503); res.end(); }
+    return;
+  }
+
   if ((url === `${BASE}/run` || url === `${BASE}/resume`) && method === 'POST') {
     let body = '';
     req.on('data', d => { body += d; });
@@ -143,9 +177,10 @@ const server = http.createServer((req, res) => {
       // Answer fast; the mount runs in the background (see mountHome).
       res.writeHead(200); res.end();
       mountHome(accessPointId);
-      // Warm the demand-paged disk paths a Claude session needs (node_modules,
-      // shared libs, coreutils) once per boot. The Claude CLI itself is in
-      // tmpfs (memory snapshot), not here.
+      // Warm the demand-paged disk paths a Claude session needs (CLI bundle,
+      // shared libs, coreutils) once per boot. The /validate hook taught the
+      // platform to prefetch these; this warmup is the second layer that
+      // faults them in before the user's first keystroke needs them.
       if (url === `${BASE}/run`) prefetchDisk();
     });
     return;
