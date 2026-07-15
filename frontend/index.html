@@ -94,6 +94,7 @@
       border-bottom: 1px solid #0f3460;
       flex-shrink: 0;
       min-height: 44px;
+      gap: 10px;
     }
     #header h1 {
       font-size: 15px;
@@ -101,6 +102,23 @@
       color: #f0f6fc;
       letter-spacing: 0.5px;
     }
+    #header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #split-btn {
+      background: #0f3460;
+      color: #a8b2d8;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      line-height: 1;
+      padding: 5px 12px;
+      cursor: pointer;
+    }
+    #split-btn:active { background: #1a4a8a; }
+    #split-btn:disabled { opacity: 0.4; cursor: default; }
     #status {
       font-size: 12px;
       padding: 3px 10px;
@@ -111,17 +129,48 @@
     #status.connected { background: #1a4a1a; color: #4caf50; }
     #status.error { background: #4a1a1a; color: #f44336; }
     #status.warming { background: #3d2e0f; color: #d29922; }
-    #terminal-container {
+    /* Panes: side-by-side in landscape, stacked in portrait */
+    #panes {
       flex: 1;
+      display: flex;
+      flex-direction: row;
       overflow: hidden;
-      padding: 4px;
       min-height: 0;
       position: relative;
+      gap: 1px;
+      background: #0f3460; /* shows through the gap as a divider line */
     }
-    #terminal {
-      width: 100%;
-      height: 100%;
+    @media (orientation: portrait) {
+      #panes { flex-direction: column; }
     }
+    .pane {
+      flex: 1;
+      min-width: 0;
+      min-height: 0;
+      position: relative;
+      background: #0d1117;
+      padding: 4px;
+      border: 1px solid transparent;
+    }
+    .pane.focused { border-color: #1f3a5f; }
+    .pane .term { width: 100%; height: 100%; }
+    .pane-close {
+      display: none;
+      position: absolute;
+      top: 6px;
+      right: 10px;
+      z-index: 5;
+      background: rgba(22, 33, 62, 0.85);
+      color: #8b949e;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+    .pane-close:active { color: #f85149; border-color: #f85149; }
+    #panes.multi .pane-close { display: block; }
     #loading {
       display: flex;
       flex-direction: column;
@@ -184,15 +233,17 @@
 <div id="app" style="display:none; height:100%; height:100dvh; flex-direction:column;">
   <div id="header">
     <h1>Claude Code</h1>
-    <span id="status">Connecting…</span>
+    <div id="header-actions">
+      <button id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
+      <span id="status">Connecting…</span>
+    </div>
   </div>
   <div id="error-banner"></div>
-  <div id="terminal-container">
+  <div id="panes">
     <div id="loading">
       <div class="spinner"></div>
       <div id="loading-msg">Loading terminal…</div>
     </div>
-    <div id="terminal"></div>
   </div>
 </div>
 
@@ -203,6 +254,8 @@
 // ── Config ──────────────────────────────────────────────────────────────────
 const CONFIG = window.APP_CONFIG || {};
 const TOKEN_API_URL = CONFIG.tokenApiUrl || '';
+const MAX_PANES = 4;
+const PANES_STORAGE_KEY = 'ipad-claude-panes';
 
 // ── Cognito auth ──────────────────────────────────────────────────────────────
 // amazon-cognito-identity-js persists sessions in localStorage and refreshes
@@ -292,22 +345,19 @@ document.addEventListener('DOMContentLoaded', () => {
   getIdToken().then(() => showApp()).catch(() => {/* show login */});
 });
 
-// ── State ────────────────────────────────────────────────────────────────────
-let terminal, fitAddon, ws;
+// ── Shared connection state (token/endpoint are per-VM, shared by all panes) ──
 let authToken = null, mvmEndpoint = null;
 let vmState = 'running'; // 'running' | 'starting' | 'resuming' — from the token API
 let tokenExpiresAt = 0;
 let refreshTimer = null;
-let reconnectAttempts = 0;
-let reconnectTimer = null;
-let pingTimer = null;
-let lastPong = 0;
+let tokenInFlight = null; // dedup concurrent fetches from multiple panes
 
 const statusEl = document.getElementById('status');
 const loadingEl = document.getElementById('loading');
 const loadingMsgEl = document.getElementById('loading-msg');
-const terminalContainerEl = document.getElementById('terminal');
+const panesEl = document.getElementById('panes');
 const errorBannerEl = document.getElementById('error-banner');
+const splitBtnEl = document.getElementById('split-btn');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -325,24 +375,28 @@ function clearError() {
 }
 
 // ── Token fetch ──────────────────────────────────────────────────────────────
-async function fetchToken() {
-  // API Gateway's Cognito authorizer expects the JWT in Authorization.
-  const jwt = await getIdToken();
-  const resp = await fetch(TOKEN_API_URL, { headers: { Authorization: `Bearer ${jwt}` } });
-  if (resp.status === 401) { signOut(); throw new Error('Session expired — please sign in again'); }
-  if (!resp.ok) throw new Error(`Token API ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
-  authToken = data.authToken;
-  mvmEndpoint = data.endpoint;
-  vmState = data.vmState || 'running';
-  tokenExpiresAt = Date.now() + data.expiresInSeconds * 1000;
+function fetchToken() {
+  if (tokenInFlight) return tokenInFlight; // all panes share one request
+  tokenInFlight = (async () => {
+    // API Gateway's Cognito authorizer expects the JWT in Authorization.
+    const jwt = await getIdToken();
+    const resp = await fetch(TOKEN_API_URL, { headers: { Authorization: `Bearer ${jwt}` } });
+    if (resp.status === 401) { signOut(); throw new Error('Session expired — please sign in again'); }
+    if (!resp.ok) throw new Error(`Token API ${resp.status}: ${await resp.text()}`);
+    const data = await resp.json();
+    authToken = data.authToken;
+    mvmEndpoint = data.endpoint;
+    vmState = data.vmState || 'running';
+    tokenExpiresAt = Date.now() + data.expiresInSeconds * 1000;
 
-  // Schedule refresh 5 min before expiry
-  const refreshIn = (data.expiresInSeconds - 300) * 1000;
-  if (refreshTimer) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refreshToken, Math.max(refreshIn, 30000));
+    // Schedule refresh 5 min before expiry
+    const refreshIn = (data.expiresInSeconds - 300) * 1000;
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refreshToken, Math.max(refreshIn, 30000));
 
-  return data;
+    return data;
+  })();
+  return tokenInFlight.finally(() => { tokenInFlight = null; });
 }
 
 async function refreshToken() {
@@ -356,161 +410,13 @@ async function refreshToken() {
   }
 }
 
-// ── Terminal init ────────────────────────────────────────────────────────────
-function initTerminal() {
-  terminal = new Terminal({
-    theme: {
-      background: '#0d1117',
-      foreground: '#c9d1d9',
-      cursor: '#58a6ff',
-      black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
-      blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
-      brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
-      brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
-      brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
-    },
-    fontFamily: '"SF Mono", "Fira Code", Menlo, monospace',
-    fontSize: 14,
-    lineHeight: 1.3,
-    scrollback: 5000,
-    cursorBlink: true,
-    allowTransparency: false,
-    macOptionIsMeta: true,
-  });
-
-  fitAddon = new FitAddon.FitAddon();
-  terminal.loadAddon(fitAddon);
-  terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
-
-  terminal.open(terminalContainerEl);
-  fitAddon.fit();
-
-  // Click/tap anywhere on terminal to ensure keyboard focus
-  terminalContainerEl.addEventListener('click', () => terminal.focus());
-  terminalContainerEl.addEventListener('touchend', (e) => {
-    e.preventDefault();
-    terminal.focus();
-  }, { passive: false });
-
-  // Resize on window resize and orientation change
-  const resizeObserver = new ResizeObserver(() => {
-    try { fitAddon.fit(); } catch {}
-  });
-  resizeObserver.observe(document.getElementById('terminal-container'));
-  window.addEventListener('orientationchange', () => setTimeout(() => fitAddon.fit(), 300));
-
-  // Register input handlers once — ws is a module-level var so they always use the current connection
-  terminal.onData((data) => {
-    if (!ws || ws.readyState !== 1) return;
-    const encoded = new TextEncoder().encode(data);
-    const msg = new Uint8Array(1 + encoded.length);
-    msg[0] = 0x30;
-    msg.set(encoded, 1);
-    ws.send(msg);
-  });
-
-  terminal.onResize(() => sendResize());
+// Valid token available (fetching one if missing/near expiry).
+async function ensureToken() {
+  if (authToken && Date.now() < tokenExpiresAt - 60000) return;
+  await fetchToken();
 }
 
-// ── WebSocket connect ─────────────────────────────────────────────────────────
-function connectWs() {
-  if (!authToken || !mvmEndpoint) return;
-  if (ws && ws.readyState < 2) { ws.close(); }
-
-  // Convert https:// to wss://
-  const wsUrl = mvmEndpoint.replace(/^https?:\/\//, 'wss://') + '/';
-
-  const protocols = [
-    'lambda-microvms',
-    `lambda-microvms.authentication.${authToken}`,
-    'lambda-microvms.port.8080',
-    'tty',  // ttyd subprotocol
-  ];
-
-  ws = new WebSocket(wsUrl, protocols);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    clearError();
-    // The server replays its scrollback buffer on every (re)connect — reset the
-    // terminal first so the replay lands on a clean screen instead of stacking
-    // below the previous session's content.
-    terminal.reset();
-    ws.send(JSON.stringify({AuthToken: ''}));
-    // Don't declare "Connected" yet: while the VM boots, the ingress proxy can
-    // accept the WS handshake before the terminal server is actually serving,
-    // then drop it. Treat the connection as live only when data arrives
-    // (onmessage) — until then keep the calm warming status.
-    if (!isWarmingUp()) setStatus('Connected', 'connected');
-    fitAddon.fit();
-    sendResize(); // triggers Claude's TUI to repaint at current terminal size
-    terminal.focus();
-    startPing();
-  };
-
-  ws.onmessage = (event) => {
-    lastPong = Date.now();
-    // First data from the terminal server = the session is genuinely live.
-    if (vmState !== 'running' || reconnectAttempts > 0) {
-      vmState = 'running';
-      reconnectAttempts = 0;
-      setStatus('Connected', 'connected');
-    }
-    loadingEl.style.display = 'none';
-    // ttyd protocol: first byte is message type
-    // 0 = output data, 1 = set window title, 2 = set preferences
-    const data = event.data instanceof ArrayBuffer
-      ? new Uint8Array(event.data)
-      : new TextEncoder().encode(event.data);
-
-    if (data.length === 0) return;
-    // ttyd uses ASCII chars: '0'=48 output, '1'=49 title, '2'=50 prefs
-    const cmd = String.fromCharCode(data[0]);
-    const payload = data.slice(1);
-
-    if (cmd === '0') {
-      terminal.write(payload);
-    } else if (cmd === '1') {
-      document.title = new TextDecoder().decode(payload);
-    }
-    // cmd '2' (preferences) ignored
-  };
-
-  ws.onerror = (e) => {
-    console.error('WS error', e);
-    // Failed attempts while the VM boots are expected — stay calm, onclose
-    // will schedule the next quiet retry.
-    if (!isWarmingUp()) setStatus('Error', 'error');
-  };
-
-  ws.onclose = (e) => {
-    stopPing();
-    scheduleReconnect();
-  };
-
-}
-
-// ── Keepalive ping ────────────────────────────────────────────────────────────
-// Sends a NUL byte every 15s; if no traffic for 45s we assume the socket is dead.
-function startPing() {
-  stopPing();
-  lastPong = Date.now();
-  pingTimer = setInterval(() => {
-    if (!ws || ws.readyState !== 1) { stopPing(); return; }
-    if (Date.now() - lastPong > 45000) {
-      console.warn('Ping timeout — reconnecting');
-      ws.close();
-      return;
-    }
-    try { ws.send(new Uint8Array(1)); } catch {}
-  }, 15000);
-}
-
-function stopPing() {
-  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-}
-
-// ── Reconnect scheduling ──────────────────────────────────────────────────────
+// ── Warm-up status helpers ────────────────────────────────────────────────────
 // While the VM is warming up (fresh launch or resume from suspend), connection
 // attempts are expected to fail for a while — keep the status calm and retry
 // quietly. Red is reserved for unexpected drops of a previously-live session.
@@ -520,58 +426,347 @@ function isWarmingUp() {
   return vmState === 'starting' || vmState === 'resuming';
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return; // already scheduled
-  let delay;
+// ── Panes ─────────────────────────────────────────────────────────────────────
+// Each pane is one terminal + one WebSocket to the same VM; the server keys the
+// shell session on the `session` id sent in the handshake, so a pane survives
+// reloads/reconnects and reattaches to its shell.
+const panes = new Map(); // id -> Pane
+let focusedPane = null;
+
+class Pane {
+  constructor(id) {
+    this.id = id;
+    this.ws = null;
+    this.state = 'connecting'; // 'connecting' | 'connected' | 'disconnected'
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.pingTimer = null;
+    this.lastPong = 0;
+    this.closed = false;
+
+    // DOM
+    this.el = document.createElement('div');
+    this.el.className = 'pane';
+    this.termEl = document.createElement('div');
+    this.termEl.className = 'term';
+    this.closeBtn = document.createElement('button');
+    this.closeBtn.className = 'pane-close';
+    this.closeBtn.textContent = '✕';
+    this.closeBtn.title = 'Close this terminal (ends its shell)';
+    this.closeBtn.addEventListener('click', (e) => { e.stopPropagation(); closePane(this.id); });
+    this.el.appendChild(this.termEl);
+    this.el.appendChild(this.closeBtn);
+    panesEl.appendChild(this.el);
+
+    // Terminal
+    this.terminal = new Terminal({
+      theme: {
+        background: '#0d1117',
+        foreground: '#c9d1d9',
+        cursor: '#58a6ff',
+        black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
+        blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
+        brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
+        brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+        brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
+      },
+      fontFamily: '"SF Mono", "Fira Code", Menlo, monospace',
+      fontSize: 14,
+      lineHeight: 1.3,
+      scrollback: 5000,
+      cursorBlink: true,
+      allowTransparency: false,
+      macOptionIsMeta: true,
+    });
+    this.fitAddon = new FitAddon.FitAddon();
+    this.terminal.loadAddon(this.fitAddon);
+    this.terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
+    this.terminal.open(this.termEl);
+    this.fitAddon.fit();
+
+    // Click/tap anywhere on the pane to focus its terminal
+    this.el.addEventListener('click', () => this.focus());
+    this.el.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      this.focus();
+    }, { passive: false });
+
+    // Refit when the pane resizes (window resize, panes added/removed, rotation)
+    this.resizeObserver = new ResizeObserver(() => {
+      try { this.fitAddon.fit(); } catch {}
+    });
+    this.resizeObserver.observe(this.el);
+
+    // Input handlers registered once — this.ws always points at the live socket
+    this.terminal.onData((data) => {
+      if (!this.ws || this.ws.readyState !== 1) return;
+      const encoded = new TextEncoder().encode(data);
+      const msg = new Uint8Array(1 + encoded.length);
+      msg[0] = 0x30;
+      msg.set(encoded, 1);
+      this.ws.send(msg);
+    });
+    this.terminal.onResize(() => this.sendResize());
+  }
+
+  focus() {
+    this.terminal.focus();
+    if (focusedPane !== this) {
+      focusedPane?.el.classList.remove('focused');
+      focusedPane = this;
+      this.el.classList.add('focused');
+    }
+  }
+
+  connect() {
+    if (this.closed || !authToken || !mvmEndpoint) return;
+    if (this.ws && this.ws.readyState < 2) { this.ws.close(); }
+
+    // Convert https:// to wss://
+    const wsUrl = mvmEndpoint.replace(/^https?:\/\//, 'wss://') + '/';
+
+    const protocols = [
+      'lambda-microvms',
+      `lambda-microvms.authentication.${authToken}`,
+      'lambda-microvms.port.8080',
+      'tty',  // ttyd subprotocol
+    ];
+
+    const ws = new WebSocket(wsUrl, protocols);
+    ws.binaryType = 'arraybuffer';
+    this.ws = ws;
+
+    ws.onopen = () => {
+      clearError();
+      // The server replays the session's scrollback on every (re)connect — reset
+      // the terminal first so the replay lands on a clean screen instead of
+      // stacking below the previous content.
+      this.terminal.reset();
+      ws.send(JSON.stringify({ AuthToken: '', session: this.id }));
+      // Don't declare "Connected" yet: while the VM boots, the ingress proxy can
+      // accept the WS handshake before the terminal server is actually serving,
+      // then drop it. Treat the connection as live only when data arrives
+      // (onmessage) — until then keep the calm warming status.
+      this.fitAddon.fit();
+      this.sendResize(); // triggers the TUI to repaint at current pane size
+      if (focusedPane === this || !focusedPane) this.focus();
+      this.startPing();
+      updateStatus();
+    };
+
+    ws.onmessage = (event) => {
+      this.lastPong = Date.now();
+      // First data from the terminal server = the session is genuinely live.
+      if (this.state !== 'connected' || vmState !== 'running') {
+        vmState = 'running';
+        this.state = 'connected';
+        this.reconnectAttempts = 0;
+        updateStatus();
+      }
+      loadingEl.style.display = 'none';
+      // ttyd protocol: first byte is message type
+      // 0 = output data, 1 = set window title, 2 = set preferences
+      const data = event.data instanceof ArrayBuffer
+        ? new Uint8Array(event.data)
+        : new TextEncoder().encode(event.data);
+
+      if (data.length === 0) return;
+      // ttyd uses ASCII chars: '0'=48 output, '1'=49 title, '2'=50 prefs
+      const cmd = String.fromCharCode(data[0]);
+      const payload = data.slice(1);
+
+      if (cmd === '0') {
+        this.terminal.write(payload);
+      } else if (cmd === '1' && this.id === 'main') {
+        document.title = new TextDecoder().decode(payload);
+      }
+      // cmd '2' (preferences) ignored
+    };
+
+    ws.onerror = (e) => {
+      console.error(`WS error [${this.id}]`, e);
+      // Failed attempts while the VM boots are expected — stay calm, onclose
+      // will schedule the next quiet retry.
+    };
+
+    ws.onclose = () => {
+      this.stopPing();
+      if (this.closed) return;
+      this.state = 'disconnected';
+      this.scheduleReconnect();
+    };
+  }
+
+  // Keepalive ping: a NUL byte every 15s; no traffic for 45s = dead socket.
+  startPing() {
+    this.stopPing();
+    this.lastPong = Date.now();
+    this.pingTimer = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== 1) { this.stopPing(); return; }
+      if (Date.now() - this.lastPong > 45000) {
+        console.warn(`Ping timeout [${this.id}] — reconnecting`);
+        this.ws.close();
+        return;
+      }
+      try { this.ws.send(new Uint8Array(1)); } catch {}
+    }, 15000);
+  }
+
+  stopPing() {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer || this.closed) return; // already scheduled
+    let delay;
+    if (isWarmingUp()) {
+      delay = 3000; // steady poll while booting — no alarming backoff countdown
+    } else {
+      delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    }
+    this.reconnectAttempts++;
+    updateStatus();
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try { await ensureToken(); } catch (e) {
+        updateStatus();
+        showError(`Failed to get session token: ${e.message}`);
+        this.scheduleReconnect();
+        return;
+      }
+      this.connect();
+    }, delay);
+  }
+
+  reconnectNow() {
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.reconnectAttempts = 0;
+    if (!this.ws || this.ws.readyState > 1) {
+      ensureToken().then(() => this.connect()).catch(e => showError(`Failed to get session token: ${e.message}`));
+    }
+  }
+
+  sendResize() {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    const { cols, rows } = this.terminal;
+    // ttyd resize: binary frame, first byte '1' (0x31) then JSON
+    const json = JSON.stringify({ columns: cols, rows });
+    const encoded = new TextEncoder().encode(json);
+    const msg = new Uint8Array(1 + encoded.length);
+    msg[0] = 0x31; // ASCII '1'
+    msg.set(encoded, 1);
+    this.ws.send(msg);
+  }
+
+  // Permanently close this pane: tell the server to kill the shell, then tear down.
+  destroy() {
+    this.closed = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.stopPing();
+    if (this.ws && this.ws.readyState === 1) {
+      try { this.ws.send(new Uint8Array([0x33])); } catch {} // cmd '3' = kill session
+      try { this.ws.close(); } catch {}
+    }
+    this.resizeObserver.disconnect();
+    this.terminal.dispose();
+    this.el.remove();
+    if (focusedPane === this) focusedPane = null;
+  }
+}
+
+// ── Pane management ───────────────────────────────────────────────────────────
+function savedPaneIds() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(PANES_STORAGE_KEY));
+    if (Array.isArray(ids) && ids.length && ids.every(x => typeof x === 'string')) {
+      return ids.slice(0, MAX_PANES);
+    }
+  } catch {}
+  return ['main'];
+}
+
+function savePaneIds() {
+  try { localStorage.setItem(PANES_STORAGE_KEY, JSON.stringify([...panes.keys()])); } catch {}
+}
+
+function updatePaneChrome() {
+  panesEl.classList.toggle('multi', panes.size > 1);
+  splitBtnEl.disabled = panes.size >= MAX_PANES;
+}
+
+function createPane(id) {
+  const pane = new Pane(id);
+  panes.set(id, pane);
+  updatePaneChrome();
+  return pane;
+}
+
+function addPane() {
+  if (panes.size >= MAX_PANES) return;
+  // Stable-ish id: reuse the lowest free t<N> so a reload reattaches sanely.
+  let id = null;
+  for (let n = 2; n <= MAX_PANES + 1; n++) {
+    if (!panes.has(`t${n}`)) { id = `t${n}`; break; }
+  }
+  const pane = createPane(id);
+  savePaneIds();
+  ensureToken()
+    .then(() => { pane.connect(); })
+    .catch(e => showError(`Failed to get session token: ${e.message}`));
+  pane.focus();
+}
+
+function closePane(id) {
+  const pane = panes.get(id);
+  if (!pane || panes.size <= 1) return;
+  if (!confirm('Close this terminal? Its shell (and anything running in it) will end.')) return;
+  panes.delete(id);
+  pane.destroy();
+  savePaneIds();
+  updatePaneChrome();
+  updateStatus();
+  // Give remaining panes their new size, and focus one
+  const first = panes.values().next().value;
+  first?.focus();
+}
+
+// ── Aggregate status ──────────────────────────────────────────────────────────
+function updateStatus() {
   if (isWarmingUp()) {
     setStatus(WARMUP_STATUS[vmState], 'warming');
     loadingMsgEl.textContent = WARMUP_STATUS[vmState];
-    delay = 3000; // steady poll while booting — no alarming backoff countdown
-  } else {
-    setStatus('Disconnected', 'error');
-    delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-    if (delay > 1000) setStatus(`Reconnecting in ${Math.round(delay/1000)}s…`, 'error');
+    return;
   }
-  reconnectAttempts++;
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; start(false); }, delay);
+  const states = [...panes.values()].map(p => p.state);
+  if (states.length && states.every(s => s === 'connected')) {
+    setStatus('Connected', 'connected');
+  } else if (states.some(s => s === 'connected')) {
+    setStatus('Reconnecting…', 'error'); // some pane dropped
+  } else if (states.some(s => s === 'disconnected')) {
+    setStatus('Disconnected', 'error');
+  } else {
+    setStatus('Connecting…');
+  }
 }
-
-// Reset pong timestamp on any incoming message (proves the socket is alive)
-const _origConnectWs = connectWs;
 
 // ── Visibility-change: reconnect immediately when tab comes back ──────────────
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  lastPong = Date.now(); // suppress false ping-timeout on wake
-  if (!ws || ws.readyState > 1) {
-    // Socket is closed or closing — reconnect immediately, skip backoff
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    reconnectAttempts = 0;
-    start(false);
+  for (const pane of panes.values()) {
+    pane.lastPong = Date.now(); // suppress false ping-timeout on wake
+    if (!pane.ws || pane.ws.readyState > 1) pane.reconnectNow();
   }
 });
 
-function sendResize() {
-  if (!ws || ws.readyState !== 1) return;
-  const { cols, rows } = terminal;
-  // ttyd resize: binary frame, first byte '1' (0x31) then JSON
-  const json = JSON.stringify({ columns: cols, rows });
-  const encoded = new TextEncoder().encode(json);
-  const msg = new Uint8Array(1 + encoded.length);
-  msg[0] = 0x31; // ASCII '1'
-  msg.set(encoded, 1);
-  ws.send(msg);
-}
+window.addEventListener('orientationchange', () => setTimeout(() => {
+  for (const pane of panes.values()) { try { pane.fitAddon.fit(); } catch {} }
+}, 300));
 
 // ── Main ─────────────────────────────────────────────────────────────────────
-async function start(initTerm = true) {
+async function start() {
   clearError();
-  if (isWarmingUp()) {
-    setStatus(WARMUP_STATUS[vmState], 'warming');
-  } else {
-    setStatus('Connecting…');
-    loadingMsgEl.textContent = 'Connecting to MicroVM…';
-  }
+  setStatus(isWarmingUp() ? WARMUP_STATUS[vmState] : 'Connecting…', isWarmingUp() ? 'warming' : '');
+  loadingMsgEl.textContent = 'Connecting to MicroVM…';
   loadingEl.style.display = 'flex';
 
   try {
@@ -588,17 +783,17 @@ async function start(initTerm = true) {
     loadingMsgEl.textContent = WARMUP_STATUS[vmState];
   }
 
-  if (initTerm) {
-    initTerminal();
+  // Restore the saved pane layout (server-side sessions reattach by id)
+  if (panes.size === 0) {
+    for (const id of savedPaneIds()) createPane(id);
   }
-
-  connectWs();
+  for (const pane of panes.values()) pane.connect();
+  panes.get('main')?.focus();
 }
 
 function reconnect() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  reconnectAttempts = 0;
-  start(false);
+  clearError();
+  for (const pane of panes.values()) pane.reconnectNow();
 }
 
 // Start is driven by DOMContentLoaded → auto-login or manual login, not here directly

@@ -1,5 +1,8 @@
-// Node.js WebSocket terminal server — persistent PTY, ttyd-compatible protocol
-// One global shell process; clients attach/detach without killing it.
+// Node.js WebSocket terminal server — persistent PTYs, ttyd-compatible protocol
+// Multiple named sessions (one PTY each); clients pick a session in the
+// handshake ({AuthToken, session}) and attach/detach without killing it.
+// Clients that send no session id get 'main' — the original single-terminal
+// behavior. The frontend uses extra sessions for split-screen panes.
 const http = require('http');
 const WebSocket = require('/opt/app/node_modules/ws');
 
@@ -39,19 +42,35 @@ const SHELL_ENV = {
   DO_NOT_TRACK: '1',
 };
 
-const SCROLLBACK_MAX = 150 * 1024; // 150 KB — enough for a full Claude session view
-let scrollback = Buffer.alloc(0);
-let globalPty = null;
-let ptyCols = 220;
-let ptyRows = 50;
-let shellStarted = false;
-const clients = new Set();
-const pendingClients = new Set(); // connected but waiting for shell to start
+const SCROLLBACK_MAX = 150 * 1024; // 150 KB per session — a full Claude session view
 
-function appendScrollback(data) {
+// ── Sessions ──────────────────────────────────────────────────────────────────
+// id -> { pty, scrollback, cols, rows, clients, pending, shellStarted, killed }
+const sessions = new Map();
+
+function getSession(id) {
+  let s = sessions.get(id);
+  if (!s) {
+    s = {
+      id,
+      pty: null,
+      scrollback: Buffer.alloc(0),
+      cols: 220,
+      rows: 50,
+      clients: new Set(),        // attached, receiving PTY output
+      pending: new Set(),        // connected, waiting for shell to start
+      shellStarted: false,
+      killed: false,             // client asked to close this session for good
+    };
+    sessions.set(id, s);
+  }
+  return s;
+}
+
+function appendScrollback(session, data) {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const combined = Buffer.concat([scrollback, buf]);
-  scrollback = combined.length > SCROLLBACK_MAX
+  const combined = Buffer.concat([session.scrollback, buf]);
+  session.scrollback = combined.length > SCROLLBACK_MAX
     ? combined.slice(combined.length - SCROLLBACK_MAX)
     : combined;
 }
@@ -65,13 +84,24 @@ function sendOutput(ws, data) {
   ws.send(msg);
 }
 
-function broadcast(data) {
-  for (const ws of clients) sendOutput(ws, data);
+function broadcast(session, data) {
+  for (const ws of session.clients) sendOutput(ws, data);
 }
 
-function broadcastAll(data) {
-  for (const ws of clients) sendOutput(ws, data);
-  for (const ws of pendingClients) sendOutput(ws, data);
+// Every connected socket across all sessions (used for mount-status messages).
+function broadcastEveryone(data) {
+  for (const s of sessions.values()) {
+    for (const ws of s.clients) sendOutput(ws, data);
+    for (const ws of s.pending) sendOutput(ws, data);
+  }
+}
+
+function replayScrollback(session, ws) {
+  if (session.scrollback.length === 0) return;
+  const sm = Buffer.alloc(1 + session.scrollback.length);
+  sm[0] = 0x30;
+  session.scrollback.copy(sm, 1);
+  ws.send(sm);
 }
 
 const fs = require('fs');
@@ -81,14 +111,26 @@ const HOME_READY = '/tmp/home-ready';
 // Add a small buffer on top.
 const WAIT_TIMEOUT_MS = 240000;
 
+// Shared home-mount wait: the first session to need a shell drives the
+// animation; any others started meanwhile just queue their callbacks.
+let homeWaiters = null; // null = no wait in progress
+
 function waitForHome(cb) {
   if (fs.existsSync(HOME_READY)) { cb(); return; }
+  if (homeWaiters) { homeWaiters.push(cb); return; }
+  homeWaiters = [cb];
   console.log('Waiting for home mount...');
   let elapsed = 0;
   let lastDotCount = 0;
 
+  const finish = () => {
+    const waiters = homeWaiters;
+    homeWaiters = null;
+    for (const fn of waiters) fn();
+  };
+
   // Initial message
-  broadcastAll('\r\n\x1b[36mMounting workspace\x1b[0m');
+  broadcastEveryone('\r\n\x1b[36mMounting workspace\x1b[0m');
 
   const iv = setInterval(() => {
     elapsed += 500;
@@ -100,84 +142,99 @@ function waitForHome(cb) {
       const dots = '.'.repeat(dotCount);
       const pad = ' '.repeat(3 - dotCount);
       // Overwrite the dots portion only (ESC[K clears to end of line)
-      broadcastAll(`\r\x1b[36mMounting workspace${dots}${pad}\x1b[0m`);
+      broadcastEveryone(`\r\x1b[36mMounting workspace${dots}${pad}\x1b[0m`);
     }
 
     if (fs.existsSync(HOME_READY)) {
       clearInterval(iv);
-      broadcastAll('\r\n'); // newline after the dots line
+      broadcastEveryone('\r\n'); // newline after the dots line
       if (fs.existsSync('/tmp/home-ready-failed')) {
-        broadcastAll('\x1b[31m[Workspace mount failed — running without persistence]\x1b[0m\r\n');
+        broadcastEveryone('\x1b[31m[Workspace mount failed — running without persistence]\x1b[0m\r\n');
       } else {
-        broadcastAll('\x1b[32m[Workspace mounted]\x1b[0m\r\n');
+        broadcastEveryone('\x1b[32m[Workspace mounted]\x1b[0m\r\n');
       }
-      cb();
+      finish();
     } else if (elapsed >= WAIT_TIMEOUT_MS) {
       clearInterval(iv);
-      broadcastAll('\r\n\x1b[31m[Workspace mount timed out — running without persistence]\x1b[0m\r\n');
+      broadcastEveryone('\r\n\x1b[31m[Workspace mount timed out — running without persistence]\x1b[0m\r\n');
       console.warn('waitForHome timed out');
-      cb();
+      finish();
     }
   }, 500);
 }
 
-function startShell() {
+function startShell(session) {
   if (!ptyLib) {
     console.error('node-pty not available — cannot start shell');
     return;
   }
-  waitForHome(() => _spawnShell());
+  waitForHome(() => _spawnShell(session));
 }
 
-function _spawnShell() {
-  console.log(`Starting shell (${ptyCols}x${ptyRows})…`);
+function _spawnShell(session) {
+  if (session.killed) return;
+  console.log(`Starting shell [${session.id}] (${session.cols}x${session.rows})…`);
   try {
-    globalPty = ptyLib.spawn(SHELL, [], {
+    session.pty = ptyLib.spawn(SHELL, [], {
       name: 'xterm-256color',
-      cols: ptyCols,
-      rows: ptyRows,
+      cols: session.cols,
+      rows: session.rows,
       cwd: '/home/coder',
       env: SHELL_ENV,
       uid: 1000,  // run as coder — Claude Code refuses bypassPermissions as root
       gid: 1000,
     });
 
-    globalPty.onData((data) => {
-      appendScrollback(data);
-      broadcast(data);
+    session.pty.onData((data) => {
+      appendScrollback(session, data);
+      broadcast(session, data);
     });
 
-    globalPty.onExit(({ exitCode }) => {
-      console.log(`Shell exited (code ${exitCode}), restarting in 2 s…`);
-      broadcast('\r\n\x1b[33m[Shell exited — restarting…]\x1b[0m\r\n');
-      scrollback = Buffer.alloc(0);
-      globalPty = null;
-      shellStarted = false;
-      setTimeout(startShell, 2000);
+    session.pty.onExit(({ exitCode }) => {
+      session.pty = null;
+      if (session.killed) {
+        console.log(`Shell [${session.id}] exited (code ${exitCode}) — session closed`);
+        sessions.delete(session.id);
+        return;
+      }
+      console.log(`Shell [${session.id}] exited (code ${exitCode}), restarting in 2 s…`);
+      broadcast(session, '\r\n\x1b[33m[Shell exited — restarting…]\x1b[0m\r\n');
+      session.scrollback = Buffer.alloc(0);
+      session.shellStarted = false;
+      setTimeout(() => startShell(session), 2000);
     });
 
-    console.log(`Shell started (${ptyCols}x${ptyRows})`);
+    console.log(`Shell started [${session.id}] (${session.cols}x${session.rows})`);
 
     // Move any clients that were waiting for the shell to start into the active set
-    for (const ws of pendingClients) {
-      pendingClients.delete(ws);
+    for (const ws of session.pending) {
+      session.pending.delete(ws);
       if (ws.readyState === 1 /* OPEN */) {
-        if (scrollback.length > 0) {
-          const sm = Buffer.alloc(1 + scrollback.length);
-          sm[0] = 0x30;
-          scrollback.copy(sm, 1);
-          ws.send(sm);
-        }
-        clients.add(ws);
+        replayScrollback(session, ws);
+        session.clients.add(ws);
       }
     }
   } catch (e) {
-    console.error('Shell spawn failed:', e.message);
-    setTimeout(startShell, 5000);
+    console.error(`Shell spawn failed [${session.id}]:`, e.message);
+    setTimeout(() => startShell(session), 5000);
   }
 } // end _spawnShell
 
-// Shell starts on first client resize, not at startup — so it spawns at the right size.
+// A client closed its pane for good: kill the PTY and forget the session.
+function killSession(session) {
+  session.killed = true;
+  if (session.pty) {
+    try { session.pty.kill(); } catch (e) {}
+    // onExit deletes the session
+  } else {
+    sessions.delete(session.id);
+  }
+  session.clients.clear();
+  session.pending.clear();
+  console.log(`Session [${session.id}] killed by client`);
+}
+
+// Shells start on first client resize, not at startup — so each spawns at the right size.
 
 // ── HTTP server (serves minimal page for smoke-test) ──────────────────────────
 const server = http.createServer((req, res) => {
@@ -193,6 +250,7 @@ const wss = new WebSocket.Server({
 
 wss.on('connection', (ws) => {
   let authenticated = false;
+  let session = null;
 
   ws.on('message', (data, isBinary) => {
     // ── Handshake ──────────────────────────────────────────────────────────────
@@ -201,6 +259,11 @@ wss.on('connection', (ws) => {
         const msg = JSON.parse(data.toString());
         if (!('AuthToken' in msg)) return;
         authenticated = true;
+
+        // Session pick: sanitized id from the handshake, or 'main' (legacy clients).
+        const rawId = typeof msg.session === 'string' ? msg.session : 'main';
+        const id = rawId.replace(/[^\w-]/g, '').slice(0, 32) || 'main';
+        session = getSession(id);
 
         // Title frame
         const title = 'Claude Code';
@@ -214,18 +277,13 @@ wss.on('connection', (ws) => {
         pb[0] = 0x32; pb.write(prefs, 1);
         ws.send(pb);
 
-        // If shell is already running, replay scrollback and join immediately.
-        // If not yet started, hold in pendingClients until first resize sets dims.
-        if (globalPty) {
-          if (scrollback.length > 0) {
-            const sm = Buffer.alloc(1 + scrollback.length);
-            sm[0] = 0x30;
-            scrollback.copy(sm, 1);
-            ws.send(sm);
-          }
-          clients.add(ws);
+        // If the shell is already running, replay scrollback and join immediately.
+        // If not yet started, hold in pending until first resize sets dims.
+        if (session.pty) {
+          replayScrollback(session, ws);
+          session.clients.add(ws);
         } else {
-          pendingClients.add(ws);
+          session.pending.add(ws);
           // Show mounting status if home isn't ready yet
           if (!fs.existsSync(HOME_READY)) {
             sendOutput(ws, '\r\n\x1b[36mMounting workspace…\x1b[0m\r\n');
@@ -252,28 +310,31 @@ wss.on('connection', (ws) => {
     const cmd = String.fromCharCode(buf[0]);
     const payload = buf.slice(1);
 
-    if (cmd === '0' && globalPty) {
-      globalPty.write(payload.toString());
+    if (cmd === '0' && session.pty) {
+      session.pty.write(payload.toString());
     } else if (cmd === '1') {
       try {
         const dim = JSON.parse(payload.toString());
         if (dim.columns && dim.rows) {
-          ptyCols = dim.columns;
-          ptyRows = dim.rows;
-          if (globalPty) {
-            globalPty.resize(ptyCols, ptyRows);
-          } else if (!shellStarted) {
+          session.cols = dim.columns;
+          session.rows = dim.rows;
+          if (session.pty) {
+            session.pty.resize(session.cols, session.rows);
+          } else if (!session.shellStarted && !session.killed) {
             // First resize from first client — spawn shell at real terminal size
-            shellStarted = true;
-            startShell();
+            session.shellStarted = true;
+            startShell(session);
           }
         }
       } catch (e) {}
+    } else if (cmd === '3') {
+      // Frontend extension: pane closed for good — kill this session's PTY.
+      killSession(session);
     }
   });
 
-  ws.on('close', () => { clients.delete(ws); pendingClients.delete(ws); });
-  ws.on('error', () => { clients.delete(ws); pendingClients.delete(ws); });
+  ws.on('close', () => { if (session) { session.clients.delete(ws); session.pending.delete(ws); } });
+  ws.on('error', () => { if (session) { session.clients.delete(ws); session.pending.delete(ws); } });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
