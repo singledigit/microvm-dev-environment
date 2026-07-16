@@ -1,5 +1,9 @@
 export HOME=/home/coder
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/opt/uv/toolbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# npm -g installs land in the persistent home (the image prefix /usr is
+# root-owned and resets on recycle). pip needs no equivalent: it auto-falls
+# back to --user (~/.local) when site-packages isn't writable.
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
 export CLAUDE_CODE_USE_BEDROCK=1
 export AWS_REGION=us-east-1
 # Default model: Opus. Fable available via /model us.anthropic.claude-fable-5.

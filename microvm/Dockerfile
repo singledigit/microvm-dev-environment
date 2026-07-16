@@ -153,10 +153,14 @@ freedom here than in a typical local checkout, and different persistence rules.
 ## What persists (and what does not)
 - ONLY `/home/coder` persists. It is an NFS mount backed by Amazon S3, scoped
   to this user, and it survives VM restarts and recycles.
-- Everything else — `sudo dnf install`, `npm install -g`, system config — is on
-  the VM image and resets when the VM is recycled. If the user needs a tool
-  long-term, install it into the home directory or add the install command to
-  `~/.zshrc` so it self-heals on a fresh VM.
+- `npm install -g` persists: the npm prefix is `~/.npm-global` (on PATH), so
+  global npm installs land in home and survive recycles — no sudo needed.
+- `pip install` also persists: pip falls back to `--user` (`~/.local`, on
+  PATH) when system site-packages isn't writable.
+- Everything else — `sudo dnf install`, `uv tool install` (kept on /opt, see
+  below), system config — is on the VM image and resets when the VM is
+  recycled. If the user needs such a tool long-term, add the install command
+  to `~/.zshrc` so it self-heals on a fresh VM.
 - The home filesystem rejects hardlinks (EMLINK). Tools that depend on them
   should keep caches/state outside home: uv is already configured for /opt/uv;
   point similar tools at /tmp or /opt if they fail oddly in $HOME.
