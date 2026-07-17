@@ -10,7 +10,7 @@
   <!-- deploy.sh replaces the whole APP_CONFIG line with the real config JSON -->
   <script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
   <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@cocalc/xterm@5.5.0-cocalc.5/css/xterm.min.css">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -215,22 +215,6 @@
     .pane .term { width: 100%; height: 100%; }
     /* iOS: momentum scrolling on xterm's scroll container */
     .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
-    /* Native iOS long-press selection — CSS from xterm.js PR #5961 (CoCalc),
-       manually verified on iPhone Safari by its author. The key vs. a naive
-       user-select:text on rows: the override must hit the .xterm ROOT (its
-       user-select:none wins in WebKit) and all descendants, with touch-callout
-       and pointer-events re-enabled. Gated by a JS-added class on Apple
-       coarse-pointer devices only. */
-    .xterm.native-touch-sel,
-    .xterm.native-touch-sel .xterm-screen,
-    .xterm.native-touch-sel .xterm-rows,
-    .xterm.native-touch-sel .xterm-rows * {
-      -webkit-user-select: text !important;
-      user-select: text !important;
-      -webkit-touch-callout: default;
-    }
-    .xterm.native-touch-sel .xterm-rows { pointer-events: auto !important; }
-    .xterm.native-touch-sel .xterm-rows span { display: inline !important; }
     /* Toast: transient confirmation (e.g. "URL copied") */
     #toast {
       position: fixed;
@@ -359,9 +343,11 @@
   <div id="toast"></div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+<!-- @cocalc/xterm = xterm.js 5.5 + PR #5961 (native iOS touch selection/paste,
+     author-verified on iPhone Safari). Swap back to stock xterm once #5961 lands. -->
+<script src="https://cdn.jsdelivr.net/npm/@cocalc/xterm@5.5.0-cocalc.5/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script>
 // ── Config ──────────────────────────────────────────────────────────────────
 const CONFIG = window.APP_CONFIG || {};
@@ -611,21 +597,9 @@ class Pane {
     // pane close button relies on.
     this.el.addEventListener('click', () => this.focus());
 
-    // Native iOS long-press selection (approach from xterm.js PR #5961):
-    // the .native-touch-sel CSS makes the DOM-rendered rows selectable, and
-    // WebKit's own long-press UI (handles + Copy callout) takes it from there.
-    // We must also keep xterm's mousedown-driven selection machinery from
-    // preventDefault-ing the gesture's synthesized mouse events: a capture
-    // listener on the term element stops them before xterm's handlers, except
-    // when a TUI has mouse reporting on (xterm flags that with a class).
-    if (IS_APPLE_TOUCH) {
-      this.terminal.element.classList.add('native-touch-sel');
-      this.termEl.addEventListener('mousedown', (e) => {
-        if (!this.terminal.element.classList.contains('enable-mouse-events')) {
-          e.stopPropagation();
-        }
-      }, true);
-    }
+    // Native iOS long-press selection & paste come from @cocalc/xterm
+    // (xterm.js PR #5961): it detects Apple coarse-pointer devices itself,
+    // adds .xterm-native-touch-selection, and hands the gesture to WebKit.
 
     // Refit when the pane resizes (window resize, panes added/removed, rotation)
     this.resizeObserver = new ResizeObserver(() => {
