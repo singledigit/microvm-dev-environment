@@ -164,6 +164,7 @@
       color: #a8b2d8;
     }
     #status.connected { background: #1a4a1a; color: #4caf50; }
+    #build-tag { font-size: 10px; color: #4a5578; }
     #status.error { background: #4a1a1a; color: #f44336; }
     #status.warming { background: #3d2e0f; color: #d29922; }
     /* Panes: stacked by default; .side-by-side lays them out in a row */
@@ -322,6 +323,7 @@
       <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
       <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
       <span id="status">Connecting…</span>
+      <span id="build-tag"></span>
     </div>
   </div>
   <div id="error-banner"></div>
@@ -348,6 +350,8 @@
 // ── Config ──────────────────────────────────────────────────────────────────
 const CONFIG = window.APP_CONFIG || {};
 const TOKEN_API_URL = CONFIG.tokenApiUrl || '';
+// Dev builds inject CONFIG.build (deploy-dev.sh); production leaves it unset.
+if (CONFIG.build) document.getElementById('build-tag').textContent = CONFIG.build;
 const MAX_PANES = 4;
 const PANES_STORAGE_KEY = 'ipad-claude-panes';
 const LAYOUT_STORAGE_KEY = 'ipad-claude-layout'; // 'stacked' (default) | 'side-by-side'
