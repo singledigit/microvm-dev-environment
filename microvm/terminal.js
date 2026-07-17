@@ -174,11 +174,22 @@ function startShell(session) {
 
 function _spawnShell(session) {
   if (session.killed) return;
+  // The VM id is written synchronously from the /run envelope, but the
+  // endpoint comes from a background get-microvm self-lookup (hooks.js) that
+  // can lose the race against the home mount. Env vars can't be added to a
+  // running shell, so briefly wait for the endpoint file — capped at 6s so a
+  // failed lookup can never wedge shell startup. Skip when there's no id file
+  // (no /run payload, e.g. smoke-test VMs): the lookup never runs there.
+  if (fs.existsSync('/tmp/microvm-id') && !fs.existsSync('/tmp/microvm-endpoint')
+      && (session.epWaitStart ??= Date.now()) > Date.now() - 6000) {
+    setTimeout(() => _spawnShell(session), 250);
+    return;
+  }
   console.log(`Starting shell [${session.id}] (${session.cols}x${session.rows})…`);
-  // This VM's identity (written by hooks.js from the /run envelope / self-
-  // lookup) — read at spawn time, not module load: the /run hook may land
-  // after this server starts. In the env (not just rc files) so it reaches
-  // every user, including those whose persistent home has older rc files.
+  // This VM's identity — read at spawn time, not module load: the /run hook
+  // may land after this server starts. In the env (not just rc files) so it
+  // reaches every user, including those whose persistent home has older rc
+  // files.
   const vmEnv = { ...SHELL_ENV };
   try { vmEnv.MICROVM_ID = fs.readFileSync('/tmp/microvm-id', 'utf8').trim(); } catch (e) {}
   try { vmEnv.MICROVM_ENDPOINT = fs.readFileSync('/tmp/microvm-endpoint', 'utf8').trim(); } catch (e) {}
