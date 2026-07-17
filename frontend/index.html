@@ -129,19 +129,16 @@
     #status.connected { background: #1a4a1a; color: #4caf50; }
     #status.error { background: #4a1a1a; color: #f44336; }
     #status.warming { background: #3d2e0f; color: #d29922; }
-    /* Panes: side-by-side in landscape, stacked in portrait */
+    /* Panes: stacked (horizontal split) in every orientation */
     #panes {
       flex: 1;
       display: flex;
-      flex-direction: row;
+      flex-direction: column;
       overflow: hidden;
       min-height: 0;
       position: relative;
       gap: 1px;
       background: #0f3460; /* shows through the gap as a divider line */
-    }
-    @media (orientation: portrait) {
-      #panes { flex-direction: column; }
     }
     .pane {
       flex: 1;
