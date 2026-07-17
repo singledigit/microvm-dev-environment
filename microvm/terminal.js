@@ -315,7 +315,12 @@ wss.on('connection', (ws) => {
       // Typing takes size control (tmux `window-size latest` behavior): the
       // device being USED sets the PTY size, so a phone glancing at a desktop
       // session doesn't shrink it — but starts controlling once it types.
-      if (session.activeWs !== ws) {
+      // ESC-initiated input does NOT claim control: xterm auto-replies to TUI
+      // queries (cursor position \x1b[..R, device attributes) through this
+      // same path from EVERY attached client, and those must not count as
+      // typing. Cost: arrow keys alone don't claim control — fine, since any
+      // real interaction includes plain keys almost immediately.
+      if (session.activeWs !== ws && payload[0] !== 0x1b) {
         session.activeWs = ws;
         if (ws.dims && (ws.dims.cols !== session.cols || ws.dims.rows !== session.rows)) {
           session.cols = ws.dims.cols;
