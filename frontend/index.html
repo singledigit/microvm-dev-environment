@@ -178,6 +178,29 @@
       background: #0f3460; /* shows through the gap as a divider line */
     }
     #panes.side-by-side { flex-direction: row; }
+    /* Draggable divider between panes; ::before pads the touch hit area */
+    .pane-divider {
+      flex: 0 0 10px;
+      position: relative;
+      z-index: 4;
+      background: #0f3460;
+      touch-action: none;
+      cursor: row-resize;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .pane-divider::before { content: ''; position: absolute; inset: -8px 0; }
+    .pane-divider::after {
+      content: '';
+      width: 36px; height: 4px;
+      border-radius: 2px;
+      background: #30518a;
+    }
+    .pane-divider.dragging::after { background: #58a6ff; }
+    #panes.side-by-side .pane-divider { cursor: col-resize; }
+    #panes.side-by-side .pane-divider::before { inset: 0 -8px; }
+    #panes.side-by-side .pane-divider::after { width: 4px; height: 36px; }
     .pane {
       flex: 1;
       min-width: 0;
@@ -742,6 +765,57 @@ function updatePaneChrome() {
   panesEl.classList.toggle('multi', panes.size > 1);
   splitBtnEl.disabled = panes.size >= MAX_PANES;
   layoutBtnEl.style.display = panes.size > 1 ? 'block' : 'none';
+  rebuildDividers();
+}
+
+// ── Divider drag: adjust the split ratio between adjacent panes ───────────────
+// A divider sits between each pair of pane elements. Dragging converts the two
+// neighbors' pixel sizes to flex-grow values (panes are flex: 1 1 0%),
+// normalized so each pair sums to 2 — an unrelated pane at grow 1 stays the
+// "average" size. Terminals refit via each pane's ResizeObserver.
+function rebuildDividers() {
+  for (const d of panesEl.querySelectorAll('.pane-divider')) d.remove();
+  const els = [...panesEl.querySelectorAll(':scope > .pane')];
+  for (let i = 1; i < els.length; i++) {
+    const divider = document.createElement('div');
+    divider.className = 'pane-divider';
+    divider.addEventListener('pointerdown', (e) => startDividerDrag(e, divider));
+    divider.addEventListener('dblclick', () => { // reset to even split
+      for (const el of panesEl.querySelectorAll(':scope > .pane')) el.style.flexGrow = '';
+    });
+    panesEl.insertBefore(divider, els[i]);
+  }
+}
+
+function startDividerDrag(e, divider) {
+  const prev = divider.previousElementSibling;
+  const next = divider.nextElementSibling;
+  if (!prev || !next) return;
+  e.preventDefault();
+  divider.setPointerCapture(e.pointerId);
+  divider.classList.add('dragging');
+  const horizontal = panesEl.classList.contains('side-by-side');
+  const startPos = horizontal ? e.clientX : e.clientY;
+  const prevStart = horizontal ? prev.offsetWidth : prev.offsetHeight;
+  const nextStart = horizontal ? next.offsetWidth : next.offsetHeight;
+  const total = prevStart + nextStart;
+  const MIN = 80; // px — keep both panes usable
+
+  const onMove = (ev) => {
+    const delta = (horizontal ? ev.clientX : ev.clientY) - startPos;
+    const prevSize = Math.min(Math.max(prevStart + delta, MIN), total - MIN);
+    prev.style.flexGrow = (2 * prevSize / total).toFixed(4);
+    next.style.flexGrow = (2 * (total - prevSize) / total).toFixed(4);
+  };
+  const onUp = () => {
+    divider.classList.remove('dragging');
+    divider.removeEventListener('pointermove', onMove);
+    divider.removeEventListener('pointerup', onUp);
+    divider.removeEventListener('pointercancel', onUp);
+  };
+  divider.addEventListener('pointermove', onMove);
+  divider.addEventListener('pointerup', onUp);
+  divider.addEventListener('pointercancel', onUp);
 }
 
 // ── Pane layout (stacked vs side-by-side) ─────────────────────────────────────
