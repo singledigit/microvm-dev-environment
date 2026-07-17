@@ -214,6 +214,39 @@
     .pane .term { width: 100%; height: 100%; }
     /* iOS: momentum scrolling on xterm's scroll container */
     .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
+    /* Touch devices: xterm 5's DOM renderer is real text, but xterm.css sets
+       user-select: none. Re-enable it so long-press selection + the native
+       Copy callout work. (Selection may drop if output redraws mid-press;
+       the ⧉ overlay remains the fallback.) */
+    @media (pointer: coarse) {
+      .xterm .xterm-rows, .xterm .xterm-rows > div {
+        -webkit-user-select: text;
+        user-select: text;
+      }
+    }
+    /* Toast: transient confirmation (e.g. "URL copied") */
+    #toast {
+      position: fixed;
+      left: 50%;
+      bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+      transform: translateX(-50%);
+      z-index: 40;
+      background: #16213e;
+      color: #c9d1d9;
+      border: 1px solid #30518a;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-size: 13px;
+      max-width: 80vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    #toast.show { opacity: 1; pointer-events: auto; }
     .pane-close {
       display: none;
       position: absolute;
@@ -315,6 +348,7 @@
     </div>
     <pre id="copy-overlay-text"></pre>
   </div>
+  <div id="toast"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
@@ -552,7 +586,7 @@ class Pane {
     });
     this.fitAddon = new FitAddon.FitAddon();
     this.terminal.loadAddon(this.fitAddon);
-    this.terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
+    this.terminal.loadAddon(new WebLinksAddon.WebLinksAddon(activateLink));
     this.terminal.open(this.termEl);
     this.fitAddon.fit();
 
@@ -832,6 +866,32 @@ function toggleLayout() {
   const next = panesEl.classList.contains('side-by-side') ? 'stacked' : 'side-by-side';
   try { localStorage.setItem(LAYOUT_STORAGE_KEY, next); } catch {}
   applyLayout(next);
+}
+
+// ── Toast: transient notice; tap it to run an action (e.g. open copied URL) ──
+const toastEl = document.getElementById('toast');
+let toastTimer = null;
+let toastAction = null;
+function showToast(msg, action) {
+  toastEl.textContent = msg;
+  toastAction = action || null;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.classList.remove('show'); toastAction = null; }, 4000);
+}
+toastEl.addEventListener('click', () => {
+  toastEl.classList.remove('show');
+  const act = toastAction; toastAction = null;
+  act?.();
+});
+
+// Tapping a URL in the terminal copies it; the toast offers "open" as the
+// follow-up. (Straight-to-open is hostile on touch, and clipboard writes
+// must happen inside the tap gesture anyway.)
+function activateLink(event, uri) {
+  navigator.clipboard.writeText(uri)
+    .then(() => showToast(`Copied — tap to open: ${uri}`, () => window.open(uri, '_blank')))
+    .catch(() => { window.open(uri, '_blank'); }); // clipboard blocked: old behavior
 }
 
 // ── Copy / paste (iOS has no terminal selection or Cmd+V) ─────────────────────
