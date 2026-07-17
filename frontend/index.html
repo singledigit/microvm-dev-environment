@@ -214,16 +214,6 @@
     .pane .term { width: 100%; height: 100%; }
     /* iOS: momentum scrolling on xterm's scroll container */
     .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
-    /* Touch devices: xterm 5's DOM renderer is real text, but xterm.css sets
-       user-select: none. Re-enable it so long-press selection + the native
-       Copy callout work. (Selection may drop if output redraws mid-press;
-       the ⧉ overlay remains the fallback.) */
-    @media (pointer: coarse) {
-      .xterm .xterm-rows, .xterm .xterm-rows > div {
-        -webkit-user-select: text;
-        user-select: text;
-      }
-    }
     /* Toast: transient confirmation (e.g. "URL copied") */
     #toast {
       position: fixed;
@@ -597,6 +587,45 @@ class Pane {
     // pane close button relies on.
     this.el.addEventListener('click', () => this.focus());
 
+    // Long-press to copy: hold ~0.5s on a word → select it (xterm's own
+    // selection engine, so it survives redraws), lift → copy. The clipboard
+    // write must live in the touchend handler: iOS only allows it inside a
+    // real user gesture, and a timer callback doesn't qualify. Native
+    // long-press selection can't work here (xterm's selection is mouse-driven
+    // and its stylesheet is user-select: none), hence doing it by hand.
+    this.lpTimer = null;
+    this.lpFired = false;
+    this.termEl.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      this.lpFired = false;
+      const startX = t.clientX, startY = t.clientY;
+      this.lpMove = (ev) => {
+        const m = ev.touches[0];
+        if (Math.hypot(m.clientX - startX, m.clientY - startY) > 12) this.lpCancel();
+      };
+      this.lpCancel = () => {
+        clearTimeout(this.lpTimer); this.lpTimer = null;
+      };
+      this.lpTimer = setTimeout(() => {
+        this.lpTimer = null;
+        this.lpFired = this.selectWordAt(startX, startY);
+      }, 500);
+    }, { passive: true });
+    this.termEl.addEventListener('touchmove', (e) => { if (this.lpTimer) this.lpMove(e); }, { passive: true });
+    this.termEl.addEventListener('touchcancel', () => { this.lpCancel?.(); }, { passive: true });
+    this.termEl.addEventListener('touchend', (e) => {
+      this.lpCancel?.();
+      if (!this.lpFired) return;
+      this.lpFired = false;
+      e.preventDefault(); // no synthetic click: don't open a selected link or refocus
+      const text = this.terminal.getSelection();
+      if (!text) return;
+      navigator.clipboard.writeText(text)
+        .then(() => showToast(`Copied: ${text}`))
+        .catch(() => showToast('Copy blocked — use ⧉ to select manually'));
+    }, { passive: false });
+
     // Refit when the pane resizes (window resize, panes added/removed, rotation)
     this.resizeObserver = new ResizeObserver(() => {
       try { this.fitAddon.fit(); } catch {}
@@ -613,6 +642,27 @@ class Pane {
       this.ws.send(msg);
     });
     this.terminal.onResize(() => this.sendResize());
+  }
+
+  // Select the word (run of non-whitespace) at viewport pixel coordinates.
+  // Returns true if something got selected.
+  selectWordAt(clientX, clientY) {
+    const screen = this.termEl.querySelector('.xterm-screen');
+    if (!screen) return false;
+    const rect = screen.getBoundingClientRect();
+    const col = Math.floor((clientX - rect.left) / (rect.width / this.terminal.cols));
+    const row = Math.floor((clientY - rect.top) / (rect.height / this.terminal.rows));
+    if (col < 0 || col >= this.terminal.cols || row < 0 || row >= this.terminal.rows) return false;
+    const buf = this.terminal.buffer.active;
+    const line = buf.getLine(buf.viewportY + row);
+    if (!line) return false;
+    const text = line.translateToString(false); // keep trailing spaces: 1 char per cell
+    if (!text[col] || text[col] === ' ') return false;
+    let start = col, end = col;
+    while (start > 0 && text[start - 1] !== ' ') start--;
+    while (end < text.length - 1 && text[end + 1] !== ' ') end++;
+    this.terminal.select(start, buf.viewportY + row, end - start + 1);
+    return true;
   }
 
   focus() {
