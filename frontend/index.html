@@ -107,7 +107,7 @@
       align-items: center;
       gap: 10px;
     }
-    #split-btn {
+    .hdr-btn {
       background: #0f3460;
       color: #a8b2d8;
       border: none;
@@ -117,20 +117,45 @@
       padding: 5px 12px;
       cursor: pointer;
     }
-    #split-btn:active { background: #1a4a8a; }
-    #split-btn:disabled { opacity: 0.4; cursor: default; }
-    #layout-btn {
+    .hdr-btn:active { background: #1a4a8a; }
+    .hdr-btn:disabled { opacity: 0.4; cursor: default; }
+    #layout-btn { display: none; }
+    /* Copy overlay: plain selectable text of the focused terminal's buffer,
+       so iOS long-press selection and the Copy callout work normally. */
+    #copy-overlay {
       display: none;
-      background: #0f3460;
-      color: #a8b2d8;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      line-height: 1;
-      padding: 5px 12px;
-      cursor: pointer;
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      background: #0d1117;
+      flex-direction: column;
     }
-    #layout-btn:active { background: #1a4a8a; }
+    #copy-overlay.open { display: flex; }
+    #copy-overlay-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #16213e;
+      color: #a8b2d8;
+      font-size: 13px;
+      flex-shrink: 0;
+    }
+    #copy-overlay-text {
+      flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0;
+      padding: 12px 16px calc(24px + env(safe-area-inset-bottom, 0px));
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      color: #c9d1d9;
+      white-space: pre-wrap;
+      word-break: break-all;
+      -webkit-user-select: text;
+      user-select: text;
+    }
     #status {
       font-size: 12px;
       padding: 3px 10px;
@@ -164,6 +189,8 @@
     }
     .pane.focused { border-color: #1f3a5f; }
     .pane .term { width: 100%; height: 100%; }
+    /* iOS: momentum scrolling on xterm's scroll container */
+    .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
     .pane-close {
       display: none;
       position: absolute;
@@ -174,9 +201,9 @@
       color: #8b949e;
       border: 1px solid #30363d;
       border-radius: 6px;
-      font-size: 13px;
+      font-size: 15px;
       line-height: 1;
-      padding: 4px 8px;
+      padding: 10px 14px; /* comfortable touch target (~40px) */
       cursor: pointer;
     }
     .pane-close:active { color: #f85149; border-color: #f85149; }
@@ -244,8 +271,10 @@
   <div id="header">
     <h1>Claude Code</h1>
     <div id="header-actions">
-      <button id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
-      <button id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
+      <button class="hdr-btn" id="copy-btn" onclick="openCopyOverlay()" title="Select — view terminal text for copying">⧉</button>
+      <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste clipboard into the terminal">⌘V</button>
+      <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
+      <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
       <span id="status">Connecting…</span>
     </div>
   </div>
@@ -255,6 +284,13 @@
       <div class="spinner"></div>
       <div id="loading-msg">Loading terminal…</div>
     </div>
+  </div>
+  <div id="copy-overlay">
+    <div id="copy-overlay-bar">
+      <span>Long-press to select · text of the focused terminal</span>
+      <button class="hdr-btn" onclick="closeCopyOverlay()">Done</button>
+    </div>
+    <pre id="copy-overlay-text"></pre>
   </div>
 </div>
 
@@ -497,12 +533,12 @@ class Pane {
     this.terminal.open(this.termEl);
     this.fitAddon.fit();
 
-    // Click/tap anywhere on the pane to focus its terminal
+    // Click/tap anywhere on the pane to focus its terminal. Click only — iOS
+    // synthesizes click for genuine taps but not after scroll gestures, so this
+    // doesn't steal focus (and pop the keyboard) mid-scroll. A touchend handler
+    // with preventDefault here would also suppress the synthetic click that the
+    // pane close button relies on.
     this.el.addEventListener('click', () => this.focus());
-    this.el.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      this.focus();
-    }, { passive: false });
 
     // Refit when the pane resizes (window resize, panes added/removed, rotation)
     this.resizeObserver = new ResizeObserver(() => {
@@ -722,6 +758,46 @@ function toggleLayout() {
   const next = panesEl.classList.contains('side-by-side') ? 'stacked' : 'side-by-side';
   try { localStorage.setItem(LAYOUT_STORAGE_KEY, next); } catch {}
   applyLayout(next);
+}
+
+// ── Copy / paste (iOS has no terminal selection or Cmd+V) ─────────────────────
+// Copy: xterm renders to canvas, so iOS long-press selection can't touch it.
+// The ⧉ button mirrors the focused terminal's buffer into a plain <pre>,
+// where native selection and the Copy callout work.
+const copyOverlayEl = document.getElementById('copy-overlay');
+const copyOverlayTextEl = document.getElementById('copy-overlay-text');
+
+function openCopyOverlay() {
+  const pane = focusedPane || panes.values().next().value;
+  if (!pane) return;
+  const buf = pane.terminal.buffer.active;
+  const lines = [];
+  for (let i = 0; i < buf.length; i++) {
+    lines.push(buf.getLine(i)?.translateToString(true) ?? '');
+  }
+  // Drop the trailing run of blank lines below the prompt
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  copyOverlayTextEl.textContent = lines.join('\n');
+  copyOverlayEl.classList.add('open');
+  copyOverlayTextEl.scrollTop = copyOverlayTextEl.scrollHeight;
+}
+
+function closeCopyOverlay() {
+  copyOverlayEl.classList.remove('open');
+  copyOverlayTextEl.textContent = '';
+  focusedPane?.focus();
+}
+
+async function pasteClipboard() {
+  const pane = focusedPane || panes.values().next().value;
+  if (!pane) return;
+  try {
+    const text = await navigator.clipboard.readText(); // iOS shows a Paste prompt
+    if (text) pane.terminal.paste(text); // goes through onData with bracketed paste
+  } catch {
+    showError('Clipboard unavailable — allow paste access when prompted, or long-press the terminal and use the Paste callout.', false);
+  }
+  pane.focus();
 }
 
 function createPane(id) {
