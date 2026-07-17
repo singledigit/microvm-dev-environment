@@ -165,6 +165,12 @@ freedom here than in a typical local checkout, and different persistence rules.
   should keep caches/state outside home: uv is already configured for /opt/uv;
   point similar tools at /tmp or /opt if they fail oddly in $HOME.
 
+## VM identity
+- `$MICROVM_ID` is this VM's id; `$MICROVM_ENDPOINT` is its public HTTPS
+  ingress URL (both also in /tmp/microvm-id and /tmp/microvm-endpoint).
+  The endpoint reaches port 8080 (the terminal) and requires a proxy auth
+  token — it is NOT a way to expose arbitrary services publicly.
+
 ## Credentials and AWS access
 - There are no API keys anywhere. AWS access comes from the VM's IAM execution
   role via IMDSv2. You (Claude Code) run through Amazon Bedrock using that role.

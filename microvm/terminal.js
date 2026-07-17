@@ -175,19 +175,20 @@ function startShell(session) {
 function _spawnShell(session) {
   if (session.killed) return;
   console.log(`Starting shell [${session.id}] (${session.cols}x${session.rows})…`);
-  // This VM's id (written by hooks.js from the /run envelope) — read at spawn
-  // time, not module load: the /run hook may land after this server starts.
-  // In the env (not just rc files) so it reaches every user, including those
-  // whose persistent home was seeded with older rc files.
-  let mvmId = '';
-  try { mvmId = fs.readFileSync('/tmp/microvm-id', 'utf8').trim(); } catch (e) {}
+  // This VM's identity (written by hooks.js from the /run envelope / self-
+  // lookup) — read at spawn time, not module load: the /run hook may land
+  // after this server starts. In the env (not just rc files) so it reaches
+  // every user, including those whose persistent home has older rc files.
+  const vmEnv = { ...SHELL_ENV };
+  try { vmEnv.MICROVM_ID = fs.readFileSync('/tmp/microvm-id', 'utf8').trim(); } catch (e) {}
+  try { vmEnv.MICROVM_ENDPOINT = fs.readFileSync('/tmp/microvm-endpoint', 'utf8').trim(); } catch (e) {}
   try {
     session.pty = ptyLib.spawn(SHELL, [], {
       name: 'xterm-256color',
       cols: session.cols,
       rows: session.rows,
       cwd: '/home/coder',
-      env: mvmId ? { ...SHELL_ENV, MICROVM_ID: mvmId } : SHELL_ENV,
+      env: vmEnv,
       uid: 1000,  // run as coder — Claude Code refuses bypassPermissions as root
       gid: 1000,
     });

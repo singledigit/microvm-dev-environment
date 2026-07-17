@@ -12,6 +12,22 @@ const BASE = '/aws/lambda-microvms/runtime/v1';
 const MOUNT_PATH = '/home/coder';
 const AP_FILE = '/tmp/access-point-id';
 const MVM_ID_FILE = '/tmp/microvm-id';
+const MVM_EP_FILE = '/tmp/microvm-endpoint';
+
+// The public endpoint isn't derivable from the VM id and may not be in the
+// /run envelope — ask the control plane about ourselves (execution role has
+// PowerUserAccess, so get-microvm is allowed). Background + best-effort.
+function lookupEndpoint(mvmId) {
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const child = spawn('/bin/sh', ['-c',
+    `EP=$(aws lambda-microvms get-microvm --microvm-identifier "${mvmId}" ` +
+    `--region "${region}" --query endpoint --output text 2>/dev/null); ` +
+    'EP=${EP#https://}; [ -n "$EP" ] && [ "$EP" != "None" ] && ' +
+    `echo "https://$EP" > ${MVM_EP_FILE}; ` +
+    'echo "endpoint lookup: [$EP]" >> /tmp/hooks.log'
+  ], { detached: true, stdio: 'ignore' });
+  child.unref();
+}
 let appReady = false;
 let validateStarted = false;
 
@@ -133,7 +149,7 @@ const server = http.createServer((req, res) => {
       // JSON string nested inside JSON). We parse defensively (envelope key,
       // raw JSON, and base64 variants) so it's robust to shape changes.
       // The raw body is logged as a one-liner for future diagnosis.
-      try { fs.appendFileSync('/tmp/hooks.log', `RAW ${url} BODY=[${(body||'').slice(0, 200)}]\n`); } catch {}
+      try { fs.appendFileSync('/tmp/hooks.log', `RAW ${url} BODY=[${(body||'').slice(0, 1000)}]\n`); } catch {}
       let accessPointId = '';
       const tryExtract = (s) => {
         if (!s) return '';
@@ -168,6 +184,10 @@ const server = http.createServer((req, res) => {
         // path, for the same reason as the accessPointId parsing above.
         const idMatch = (body || '').match(/micro[Vv]m[Ii]d\\?["']?\s*:\s*\\?["']?\s*((?:microvm|mvm)-[0-9a-zA-Z-]+)/);
         if (idMatch) fs.writeFileSync(MVM_ID_FILE, idMatch[1]);
+        // Endpoint: straight from the envelope if present, else self-lookup.
+        const epMatch = (body || '').match(/([\w-]+\.lambda-microvm\.[\w.-]+\.on\.aws)/);
+        if (epMatch) fs.writeFileSync(MVM_EP_FILE, `https://${epMatch[1]}`);
+        else if (idMatch && !fs.existsSync(MVM_EP_FILE)) lookupEndpoint(idMatch[1]);
       } catch (e) {
         console.error('Failed to parse run payload:', e.message);
       }
