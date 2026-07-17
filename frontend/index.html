@@ -600,6 +600,13 @@ class Pane {
     // Native iOS long-press selection & paste come from @cocalc/xterm
     // (xterm.js PR #5961): it detects Apple coarse-pointer devices itself,
     // adds .xterm-native-touch-selection, and hands the gesture to WebKit.
+    //
+    // That mode routes touches to the text rows, which took them away from
+    // xterm's scroll viewport — so drags must be turned into scrolling by
+    // hand. Disambiguation: move early = scroll (pixel-tracked, with
+    // momentum); hold still = WebKit's long-press selection, untouched.
+    // While a selection exists, all touches are WebKit's (handle dragging).
+    if (IS_APPLE_TOUCH) this.attachTouchScroll();
 
     // Refit when the pane resizes (window resize, panes added/removed, rotation)
     this.resizeObserver = new ResizeObserver(() => {
@@ -626,6 +633,74 @@ class Pane {
       focusedPane = this;
       this.el.classList.add('focused');
     }
+  }
+
+  cellHeight() {
+    const screen = this.termEl.querySelector('.xterm-screen');
+    return screen ? screen.getBoundingClientRect().height / this.terminal.rows : 20;
+  }
+
+  // Smooth touch scrolling: sub-line pixel accumulation while dragging, then
+  // momentum (exponential decay) on release. scrollLines is line-quantized —
+  // the carry keeps leftover pixels so slow drags still add up instead of
+  // stalling below one line per event (the old jerkiness).
+  attachTouchScroll() {
+    let mode = null;          // null (undecided) | 'scroll' | 'select'
+    let lastY = 0, carry = 0, velocity = 0, lastT = 0;
+    let momentumId = null;
+
+    const stopMomentum = () => { if (momentumId) { cancelAnimationFrame(momentumId); momentumId = null; } };
+
+    const scrollByPixels = (px) => {
+      carry += px;
+      const cell = this.cellHeight();
+      const lines = Math.trunc(carry / cell);
+      if (lines !== 0) {
+        carry -= lines * cell;
+        this.terminal.scrollLines(-lines); // finger down = content up = scroll back
+      }
+    };
+
+    this.termEl.addEventListener('touchstart', (e) => {
+      stopMomentum();
+      if (e.touches.length !== 1) { mode = 'select'; return; } // pinch etc. → not ours
+      // An existing selection means WebKit is mid-gesture (dragging handles)
+      mode = String(window.getSelection() || '') ? 'select' : null;
+      lastY = e.touches[0].clientY;
+      lastT = e.timeStamp;
+      carry = 0; velocity = 0;
+    }, { passive: true });
+
+    this.termEl.addEventListener('touchmove', (e) => {
+      if (mode === 'select' || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      const dy = y - lastY;
+      if (mode === null) {
+        if (Math.abs(dy) < 8) return;      // undecided: could still be a long-press
+        mode = 'scroll';
+      }
+      e.preventDefault();                  // scroll mode: keep WebKit selection out of it
+      const dt = Math.max(e.timeStamp - lastT, 1);
+      velocity = velocity * 0.7 + (dy / dt) * 0.3;  // smoothed px/ms
+      scrollByPixels(dy);
+      lastY = y; lastT = e.timeStamp;
+    }, { passive: false });
+
+    const end = () => {
+      if (mode !== 'scroll') { mode = null; return; }
+      mode = null;
+      let v = velocity * 16;               // px per ~frame
+      if (Math.abs(v) < 4) return;         // too slow — no fling
+      const step = () => {
+        v *= 0.95;
+        if (Math.abs(v) < 0.5) { momentumId = null; return; }
+        scrollByPixels(v);
+        momentumId = requestAnimationFrame(step);
+      };
+      momentumId = requestAnimationFrame(step);
+    };
+    this.termEl.addEventListener('touchend', end, { passive: true });
+    this.termEl.addEventListener('touchcancel', () => { mode = null; }, { passive: true });
   }
 
   connect() {
