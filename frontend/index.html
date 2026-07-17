@@ -120,6 +120,7 @@
     .hdr-btn:active { background: #1a4a8a; }
     .hdr-btn:disabled { opacity: 0.4; cursor: default; }
     #layout-btn { display: none; }
+    #terminate-btn:active { background: #4a1a1a; color: #f85149; }
     /* Copy overlay: plain selectable text of the focused terminal's buffer,
        so iOS long-press selection and the Copy callout work normally. */
     #copy-overlay {
@@ -322,6 +323,7 @@
       <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste clipboard into the terminal">⌘V</button>
       <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
       <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
+      <button class="hdr-btn" id="terminate-btn" onclick="terminateVm()" title="Terminate this VM (files persist; a fresh VM starts on reload)">⏻</button>
       <span id="status">Connecting…</span>
       <span id="build-tag"></span>
     </div>
@@ -503,6 +505,32 @@ function fetchToken() {
     return data;
   })();
   return tokenInFlight.finally(() => { tokenInFlight = null; });
+}
+
+// ── Terminate this user's VM ─────────────────────────────────────────────────
+// DELETE /token kills the caller's own VM (server-side identity — the Lambda
+// resolves the VM from the verified Cognito sub). Home dir persists; the next
+// token fetch launches a fresh VM.
+async function terminateVm() {
+  if (!confirm('Terminate this VM?\n\nAnything currently RUNNING stops (shells, builds, Claude sessions). Files in /home/coder are safe and a fresh VM starts automatically.')) return;
+  const btn = document.getElementById('terminate-btn');
+  btn.disabled = true;
+  try {
+    const jwt = await getIdToken();
+    const resp = await fetch(TOKEN_API_URL, { method: 'DELETE', headers: { Authorization: `Bearer ${jwt}` } });
+    if (!resp.ok) throw new Error(`Terminate failed (${resp.status}): ${await resp.text()}`);
+    // Drop panes quietly (no per-pane kill messages to a dying VM) and reset
+    // to a clean single-pane layout for the fresh VM.
+    for (const pane of panes.values()) { pane.closed = true; try { pane.ws?.close(); } catch {} }
+    panes.clear();
+    try { localStorage.removeItem(PANES_STORAGE_KEY); } catch {}
+    authToken = null; tokenExpiresAt = 0; vmState = 'starting';
+    showToast('VM terminated — starting a fresh one…');
+    setTimeout(() => location.reload(), 1500);
+  } catch (e) {
+    showError(`Couldn't terminate: ${e.message}`);
+    btn.disabled = false;
+  }
 }
 
 async function refreshToken() {

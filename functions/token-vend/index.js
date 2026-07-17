@@ -110,6 +110,10 @@ async function resumeMvm(mvmId) {
   await sigv4Request('POST', mvmHost(), `/2025-09-09/microvms/${encodeURIComponent(mvmId)}/resume`, {});
 }
 
+async function terminateMvm(mvmId) {
+  await sigv4Request('DELETE', mvmHost(), `/2025-09-09/microvms/${encodeURIComponent(mvmId)}`, undefined);
+}
+
 async function runNewMvm(accessPointId) {
   const imageArn = process.env.IMAGE_ARN;
   const executionRoleArn = process.env.EXECUTION_ROLE_ARN;
@@ -159,7 +163,7 @@ async function mintToken(mvmId) {
 exports.handler = async (event) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': process.env.ALLOWED_ORIGINS || '*',
-    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
   };
 
@@ -185,6 +189,43 @@ exports.handler = async (event) => {
   const mvmIdParam = `/ipad-claude/users/${sub}/mvm-identifier`;
   const mvmEndpointParam = `/ipad-claude/users/${sub}/mvm-endpoint`;
 
+  // ── DELETE /token: terminate THIS user's VM ───────────────────────────────
+  // The VM id comes from the caller's own SSM parameter (keyed by their
+  // verified Cognito sub) — never from the request — so a user can only ever
+  // terminate their own VM. Their home survives (it's the S3 Files mount);
+  // the next GET /token launches a fresh VM.
+  if (method === 'DELETE') {
+    try {
+      let mvmId = '';
+      try { mvmId = await getParam(mvmIdParam); } catch (e) { /* none yet */ }
+      if (mvmId === '-') mvmId = ''; // already terminated earlier
+      if (mvmId) {
+        try {
+          await terminateMvm(mvmId);
+          console.log(`User ${sub} terminated their VM ${mvmId}`);
+        } catch (e) {
+          if (e.statusCode !== 404) throw e; // already gone = success
+        }
+        // Clear the pointer so the next GET launches fresh instead of finding
+        // a TERMINATED VM (also prevents deploy.sh --recreate-image from
+        // trying to terminate it again).
+        await putParam(mvmIdParam, '-');
+      }
+      return {
+        statusCode: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ terminated: mvmId || null }),
+      };
+    } catch (err) {
+      console.error('Terminate error:', err.message);
+      return {
+        statusCode: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: err.message }),
+      };
+    }
+  }
+
   // ── Ensure a live MicroVM exists for THIS user ────────────────────────────
   try {
     let mvmId = '';
@@ -202,6 +243,7 @@ exports.handler = async (event) => {
       console.log('No MVM for this user yet, will launch one');
     }
 
+    if (mvmId === '-') mvmId = ''; // sentinel from DELETE (SSM forbids empty values)
     if (mvmId) {
       const state = await getMvmState(mvmId);
       console.log(`MVM ${mvmId} state: ${state}`);

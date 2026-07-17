@@ -11,6 +11,7 @@ const { execSync, spawn } = require('child_process');
 const BASE = '/aws/lambda-microvms/runtime/v1';
 const MOUNT_PATH = '/home/coder';
 const AP_FILE = '/tmp/access-point-id';
+const MVM_ID_FILE = '/tmp/microvm-id';
 let appReady = false;
 let validateStarted = false;
 
@@ -160,6 +161,13 @@ const server = http.createServer((req, res) => {
           if (ap) { accessPointId = ap; break; }
         }
         if (accessPointId) fs.writeFileSync(AP_FILE, accessPointId);
+        // The platform injects this VM's own id into the /run envelope as
+        // microVmId (see skill: iam-and-security.md). Persist it so shells can
+        // export MICROVM_ID — users see which VM they're in. Tolerant match
+        // (key anywhere, escaped-JSON nesting included) rather than a JSON
+        // path, for the same reason as the accessPointId parsing above.
+        const idMatch = (body || '').match(/micro[Vv]m[Ii]d\\?["']?\s*:\s*\\?["']?\s*((?:microvm|mvm)-[0-9a-zA-Z-]+)/);
+        if (idMatch) fs.writeFileSync(MVM_ID_FILE, idMatch[1]);
       } catch (e) {
         console.error('Failed to parse run payload:', e.message);
       }

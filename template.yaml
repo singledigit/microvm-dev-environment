@@ -475,7 +475,7 @@ Resources:
       StageName: prod
       Cors:
         AllowOrigin: "'*'"
-        AllowMethods: "'GET,OPTIONS'"
+        AllowMethods: "'GET,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
@@ -529,6 +529,12 @@ Resources:
             RestApiId: !Ref TokenApi
             Path: /token
             Method: get
+        TerminateVm:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TokenApi
+            Path: /token
+            Method: delete
 
   # ── Frontend: S3 + CloudFront ─────────────────────────────────────────────────
   FrontendOac:
