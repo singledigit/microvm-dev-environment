@@ -119,6 +119,18 @@
     }
     #split-btn:active { background: #1a4a8a; }
     #split-btn:disabled { opacity: 0.4; cursor: default; }
+    #layout-btn {
+      display: none;
+      background: #0f3460;
+      color: #a8b2d8;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      line-height: 1;
+      padding: 5px 12px;
+      cursor: pointer;
+    }
+    #layout-btn:active { background: #1a4a8a; }
     #status {
       font-size: 12px;
       padding: 3px 10px;
@@ -129,7 +141,7 @@
     #status.connected { background: #1a4a1a; color: #4caf50; }
     #status.error { background: #4a1a1a; color: #f44336; }
     #status.warming { background: #3d2e0f; color: #d29922; }
-    /* Panes: stacked (horizontal split) in every orientation */
+    /* Panes: stacked by default; .side-by-side lays them out in a row */
     #panes {
       flex: 1;
       display: flex;
@@ -140,6 +152,7 @@
       gap: 1px;
       background: #0f3460; /* shows through the gap as a divider line */
     }
+    #panes.side-by-side { flex-direction: row; }
     .pane {
       flex: 1;
       min-width: 0;
@@ -232,6 +245,7 @@
     <h1>Claude Code</h1>
     <div id="header-actions">
       <button id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
+      <button id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
       <span id="status">Connecting…</span>
     </div>
   </div>
@@ -253,6 +267,7 @@ const CONFIG = window.APP_CONFIG || {};
 const TOKEN_API_URL = CONFIG.tokenApiUrl || '';
 const MAX_PANES = 4;
 const PANES_STORAGE_KEY = 'ipad-claude-panes';
+const LAYOUT_STORAGE_KEY = 'ipad-claude-layout'; // 'stacked' (default) | 'side-by-side'
 
 // ── Cognito auth ──────────────────────────────────────────────────────────────
 // amazon-cognito-identity-js persists sessions in localStorage and refreshes
@@ -355,6 +370,7 @@ const loadingMsgEl = document.getElementById('loading-msg');
 const panesEl = document.getElementById('panes');
 const errorBannerEl = document.getElementById('error-banner');
 const splitBtnEl = document.getElementById('split-btn');
+const layoutBtnEl = document.getElementById('layout-btn');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -689,6 +705,23 @@ function savePaneIds() {
 function updatePaneChrome() {
   panesEl.classList.toggle('multi', panes.size > 1);
   splitBtnEl.disabled = panes.size >= MAX_PANES;
+  layoutBtnEl.style.display = panes.size > 1 ? 'block' : 'none';
+}
+
+// ── Pane layout (stacked vs side-by-side) ─────────────────────────────────────
+function applyLayout(layout) {
+  panesEl.classList.toggle('side-by-side', layout === 'side-by-side');
+  // ⬓ = stacked, ◨ = side-by-side; the icon shows the CURRENT layout
+  layoutBtnEl.textContent = layout === 'side-by-side' ? '◨' : '⬓';
+  setTimeout(() => {
+    for (const pane of panes.values()) { try { pane.fitAddon.fit(); } catch {} }
+  }, 0);
+}
+
+function toggleLayout() {
+  const next = panesEl.classList.contains('side-by-side') ? 'stacked' : 'side-by-side';
+  try { localStorage.setItem(LAYOUT_STORAGE_KEY, next); } catch {}
+  applyLayout(next);
 }
 
 function createPane(id) {
@@ -784,6 +817,7 @@ async function start() {
   if (panes.size === 0) {
     for (const id of savedPaneIds()) createPane(id);
   }
+  try { applyLayout(localStorage.getItem(LAYOUT_STORAGE_KEY) || 'stacked'); } catch {}
   for (const pane of panes.values()) pane.connect();
   panes.get('main')?.focus();
 }
