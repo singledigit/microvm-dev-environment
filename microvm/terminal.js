@@ -59,6 +59,7 @@ function getSession(id) {
       rows: 50,
       clients: new Set(),        // attached, receiving PTY output
       pending: new Set(),        // connected, waiting for shell to start
+      activeWs: null,            // controlling client — the last one to type owns the PTY size
       shellStarted: false,
       killed: false,             // client asked to close this session for good
     };
@@ -311,17 +312,39 @@ wss.on('connection', (ws) => {
     const payload = buf.slice(1);
 
     if (cmd === '0' && session.pty) {
+      // Typing takes size control (tmux `window-size latest` behavior): the
+      // device being USED sets the PTY size, so a phone glancing at a desktop
+      // session doesn't shrink it — but starts controlling once it types.
+      if (session.activeWs !== ws) {
+        session.activeWs = ws;
+        if (ws.dims && (ws.dims.cols !== session.cols || ws.dims.rows !== session.rows)) {
+          session.cols = ws.dims.cols;
+          session.rows = ws.dims.rows;
+          try { session.pty.resize(session.cols, session.rows); } catch (e) {}
+        }
+      }
       session.pty.write(payload.toString());
     } else if (cmd === '1') {
       try {
         const dim = JSON.parse(payload.toString());
         if (dim.columns && dim.rows) {
-          session.cols = dim.columns;
-          session.rows = dim.rows;
-          if (session.pty) {
-            session.pty.resize(session.cols, session.rows);
-          } else if (!session.shellStarted && !session.killed) {
-            // First resize from first client — spawn shell at real terminal size
+          // Remember this client's size, but only the controlling client
+          // (last to type — or sole/first client) resizes the shared PTY.
+          ws.dims = { cols: dim.columns, rows: dim.rows };
+          if (!session.activeWs || session.activeWs.readyState !== WebSocket.OPEN) {
+            session.activeWs = ws;
+          }
+          if (session.activeWs === ws) {
+            session.cols = dim.columns;
+            session.rows = dim.rows;
+            if (session.pty) {
+              session.pty.resize(session.cols, session.rows);
+            } else if (!session.shellStarted && !session.killed) {
+              // First resize from first client — spawn shell at real terminal size
+              session.shellStarted = true;
+              startShell(session);
+            }
+          } else if (!session.pty && !session.shellStarted && !session.killed) {
             session.shellStarted = true;
             startShell(session);
           }
@@ -333,8 +356,27 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => { if (session) { session.clients.delete(ws); session.pending.delete(ws); } });
-  ws.on('error', () => { if (session) { session.clients.delete(ws); session.pending.delete(ws); } });
+  const detach = () => {
+    if (!session) return;
+    session.clients.delete(ws);
+    session.pending.delete(ws);
+    // Controlling client left: hand size control to a surviving client so the
+    // PTY snaps back (e.g. phone disconnects → desktop regains full width).
+    if (session.activeWs === ws) {
+      session.activeWs = null;
+      for (const other of session.clients) {
+        if (other.readyState === WebSocket.OPEN && other.dims) {
+          session.activeWs = other;
+          session.cols = other.dims.cols;
+          session.rows = other.dims.rows;
+          if (session.pty) { try { session.pty.resize(session.cols, session.rows); } catch (e) {} }
+          break;
+        }
+      }
+    }
+  };
+  ws.on('close', detach);
+  ws.on('error', detach);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
