@@ -80,6 +80,7 @@ RUN npm init -y && npm install node-pty ws && npm cache clean --force
 COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
 COPY mount-home.sh /opt/app/mount-home.sh
+COPY mcp-config.js /opt/app/mcp-config.js
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh
 
@@ -205,12 +206,16 @@ freedom here than in a typical local checkout, and different persistence rules.
 - Therefore: for long-running jobs, write progress and results to files under
   /home/coder as you go. Files survive termination; your session does not.
 
-## Tool quirks
-- WebFetch and WebSearch do not work here: their domain-safety verification
-  endpoint (claude.ai) is blocked from this network, so every fetch is rejected
-  as "unverifiable" even though the target site is reachable.
-- Use curl via Bash instead, e.g.: curl -s "https://example.com"  or
-  curl -s "wttr.in/London?format=3"
+## Web search and fetching
+- The native WebSearch and WebFetch tools are NOT available on Amazon Bedrock,
+  so they are off here. Instead you have a managed web search wired in over
+  MCP: the `web-search` tool (AWS AgentCore Web Search, backed by Amazon's own
+  index; queries stay inside AWS). Use it whenever you need current
+  information — it returns ranked snippets with source URLs and dates.
+- For fetching a specific page's contents, use curl via Bash, e.g.:
+  curl -s "https://example.com"  or  curl -s "wttr.in/London?format=3"
+- If the `web-search` MCP tool is ever unavailable (e.g. gateway not yet
+  deployed), fall back to curl against a search endpoint.
 EOF
 
 # Bedrock — uses execution role via IMDSv2
@@ -220,8 +225,8 @@ ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 # Default model: Opus (Fable requires US data residency; users may be outside US).
 # Fable available via: /model us.anthropic.claude-fable-5
-ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-4-8
-ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-4-8
+ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5
+ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
 ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
 ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ENV ANTHROPIC_SMALL_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0

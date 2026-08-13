@@ -59,6 +59,15 @@ for attempt in 1 2 3 4 5 6; do
         && chown 1000:1000 "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
         || echo "mount-home: CLAUDE.md refresh failed" >> /tmp/hooks.log
     fi
+    # Register/refresh the image-owned AgentCore web-search MCP server in the
+    # user's Claude config (preserves their other servers/settings). Also
+    # image-owned, so a redeploy's gateway URL reaches existing homes. Skips
+    # itself when WEBSEARCH_GATEWAY_URL is unset.
+    if [ -n "${WEBSEARCH_GATEWAY_URL:-}" ]; then
+      node /opt/app/mcp-config.js "$MOUNT_PATH/.claude.json" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
+        && chown 1000:1000 "$MOUNT_PATH/.claude.json" 2>>/tmp/hooks.log \
+        || echo "mount-home: web-search MCP register failed" >> /tmp/hooks.log
+    fi
     MOUNTED=true
     break
   fi

@@ -89,6 +89,7 @@ USER_POOL_ID=$(out UserPoolId)
 USER_POOL_CLIENT_ID=$(out UserPoolClientId)
 S3_FILES_FS_ID=$(out S3FilesFileSystemId)
 NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
+WEBSEARCH_GW_ROLE_ARN=$(out WebSearchGatewayRoleArn)
 
 ok "Artifact bucket : $ARTIFACT_BUCKET"
 ok "Token API       : $TOKEN_API_URL"
@@ -119,6 +120,62 @@ if [ -n "$CF_DIST_ID" ]; then
     --profile "$PROFILE" > /dev/null
 fi
 ok "Frontend synced and CDN invalidated"
+
+# ── AgentCore Web Search Gateway (out-of-band — CFN handler bug) ────────────────
+# The Gateway + Target are created here (not in template.yaml) because the CFN
+# resource handler for AWS::BedrockAgentCore::GatewayTarget has a serialization
+# bug with the connector's empty ParameterValues map. The role IS in the stack
+# (template.yaml), and the gateway is stable (create-once, reuse forever).
+log "Ensuring AgentCore web-search gateway..."
+GATEWAY_NAME="ipadclaudewebsearch"
+GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways \
+  --profile "$PROFILE" --region "$REGION" \
+  --query "items[?name=='$GATEWAY_NAME'].gatewayId | [0]" --output text 2>/dev/null || echo "")
+
+if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" = "None" ]; then
+  log "Creating AgentCore gateway '$GATEWAY_NAME'..."
+  GW_OUT=$(aws bedrock-agentcore-control create-gateway \
+    --name "$GATEWAY_NAME" \
+    --protocol-type MCP \
+    --authorizer-type AWS_IAM \
+    --role-arn "$WEBSEARCH_GW_ROLE_ARN" \
+    --profile "$PROFILE" --region "$REGION" --output json)
+  GATEWAY_ID=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayId'])")
+  WEBSEARCH_GATEWAY_URL=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayUrl'])")
+
+  # Wait for READY (typically <30s)
+  for i in $(seq 1 30); do
+    GW_STATUS=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
+      --profile "$PROFILE" --region "$REGION" --query status --output text 2>/dev/null || echo "UNKNOWN")
+    [ "$GW_STATUS" = "READY" ] && break
+    sleep 2
+  done
+  if [ "$GW_STATUS" != "READY" ]; then
+    err "Gateway stuck in $GW_STATUS"; exit 1
+  fi
+
+  log "Adding web-search connector target..."
+  aws bedrock-agentcore-control create-gateway-target \
+    --gateway-identifier "$GATEWAY_ID" \
+    --name "websearch" \
+    --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
+    --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
+    --profile "$PROFILE" --region "$REGION" --output json > /dev/null
+
+  # Wait for target READY
+  for i in $(seq 1 30); do
+    TGT_STATUS=$(aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$GATEWAY_ID" \
+      --profile "$PROFILE" --region "$REGION" --query "items[0].status" --output text 2>/dev/null || echo "UNKNOWN")
+    [ "$TGT_STATUS" = "READY" ] && break
+    sleep 2
+  done
+  ok "Web-search gateway created: $GATEWAY_ID (target: $TGT_STATUS)"
+else
+  WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
+    --profile "$PROFILE" --region "$REGION" --query gatewayUrl --output text 2>/dev/null || echo "")
+  ok "Web-search gateway exists: $GATEWAY_ID"
+fi
+ok "Web-search MCP endpoint: $WEBSEARCH_GATEWAY_URL"
 
 # ── Build MicroVM image ────────────────────────────────────────────────────────
 if [ "$SKIP_IMAGE" = false ]; then
@@ -163,6 +220,7 @@ if [ "$SKIP_IMAGE" = false ]; then
 
   log "Using S3 Files filesystem: $S3_FILES_FS_ID"
   log "Using network connector: $NETWORK_CONNECTOR_ARN"
+  log "Using web-search gateway: ${WEBSEARCH_GATEWAY_URL:-<none>}"
 
   log "Updating MicroVM image '$IMAGE_NAME' with new version..."
   IMAGE_ID=$(aws lambda-microvms list-microvm-images \
@@ -213,7 +271,7 @@ if [ "$SKIP_IMAGE" = false ]; then
       --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
       --additional-os-capabilities '["ALL"]' \
       --hooks "$HOOKS_JSON" \
-      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\",\"WEBSEARCH_GATEWAY_URL\":\"$WEBSEARCH_GATEWAY_URL\"}" \
       --profile "$PROFILE" --region "$REGION" --output json)
     IMAGE_ID=$(echo "$CREATE_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['imageArn'])")
   else
@@ -227,7 +285,7 @@ if [ "$SKIP_IMAGE" = false ]; then
       --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
       --additional-os-capabilities '["ALL"]' \
       --hooks "$HOOKS_JSON" \
-      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\",\"WEBSEARCH_GATEWAY_URL\":\"$WEBSEARCH_GATEWAY_URL\"}" \
       --profile "$PROFILE" --region "$REGION" --output json > /dev/null
   fi
 

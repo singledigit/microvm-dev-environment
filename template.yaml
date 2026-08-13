@@ -417,6 +417,16 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:ListBucket]
                 Resource: [!GetAtt WorkspaceBucket.Arn, !Sub "${WorkspaceBucket.Arn}/*"]
+              # Call the AgentCore web-search Gateway over MCP (SigV4 via the
+              # baked mcp-proxy-for-aws). The Gateway is created out-of-band by
+              # deploy.sh, so the ARN can't be referenced directly. This grant
+              # is scoped to all gateways in the account (a single gateway
+              # exists). Redundant while PowerUserAccess is attached — it
+              # already covers bedrock-agentcore — but explicit so the README's
+              # "scope PowerUserAccess down" advice stays safe.
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
         # IAM writes for in-sandbox deploys (sam deploy, CDK, etc.), gated by
         # the permissions boundary: any role created from the sandbox MUST
         # carry SandboxPermissionsBoundary, which caps it at sandbox level and
@@ -624,6 +634,40 @@ Resources:
           AssociatedComputeResourceTypes: [MicroVm]
       OperatorRole: !GetAtt NetworkConnectorOperatorRole.Arn
 
+  # ── Web search: AgentCore Gateway service role ─────────────────────────────────
+  # Native WebSearch/WebFetch are unavailable on Bedrock, so the in-VM Claude
+  # gets a real web-search tool via AWS's managed web-search connector, exposed
+  # over MCP behind an AgentCore Gateway with AWS_IAM inbound auth. The MicroVM
+  # reaches it through the already-baked, pre-warmed `mcp-proxy-for-aws`
+  # (SigV4-signed with the execution role's creds from IMDS), so there are no
+  # API keys to manage and queries stay inside AWS.
+  #
+  # The Gateway + Target themselves are created out-of-band by deploy.sh (the
+  # CFN resource handler has a serialization bug with the connector's empty
+  # ParameterValues map that causes CREATE_FAILED). This role is the outbound
+  # credential the Gateway uses to call the web-search tool.
+  WebSearchGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-websearch-gw-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: InvokeWebSearchConnector
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The tool ARN is AWS-owned (account = aws) and lives in us-east-1.
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                Resource: arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1
+
 Outputs:
   TokenApiUrl:
     Description: Token-vending API endpoint.
@@ -650,3 +694,6 @@ Outputs:
     Value: !GetAtt VpcEgressConnector.Arn
   S3FilesFileSystemId:
     Value: !GetAtt S3FilesFileSystem.FileSystemId
+  WebSearchGatewayRoleArn:
+    Description: IAM role used by the AgentCore web-search gateway (outbound connector auth).
+    Value: !GetAtt WebSearchGatewayRole.Arn

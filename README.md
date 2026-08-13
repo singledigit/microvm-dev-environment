@@ -26,6 +26,8 @@ flowchart TD
     TOKENFN["Token Lambda<br/>(find/create home,<br/>launch/resume VM,<br/>mint auth token)"]
     MVM["Per-User MicroVM<br/>(Claude Code + zsh)"]
     S3FILES[("S3 Files<br/>(/home/coder)<br/>per-user access point")]
+    ACGW["AgentCore Gateway<br/>(AWS_IAM inbound)"]
+    WEBSEARCH[("Web Search<br/>(Amazon-managed index)")]
 
     UI -->|HTTPS| CF
     CF -.->|static frontend| UI
@@ -36,6 +38,8 @@ flowchart TD
     TOKENFN -.->|"{ authToken, endpoint }"| UI
     UI -->|"WebSocket (wss)<br/>subprotocol auth"| MVM
     MVM -->|"mount (lifecycle hook)"| S3FILES
+    MVM -->|"MCP over SigV4<br/>(mcp-proxy-for-aws)"| ACGW
+    ACGW -->|"managed connector"| WEBSEARCH
 ```
 
 - **Frontend** — a single `index.html` (xterm.js) on S3, served via CloudFront.
@@ -56,18 +60,26 @@ flowchart TD
   The per-user home is mounted at run time by the `/run` lifecycle hook (which
   receives the access-point id in its payload) — `mount -o accesspoint=<id>` —
   so each user gets an isolated `/home/coder` that persists across restarts.
+- **Web search** — native WebSearch/WebFetch aren't available on Bedrock, so
+  the in-VM Claude gets web search through **Amazon Bedrock AgentCore**: the
+  managed `web-search` connector behind an AgentCore Gateway (MCP, `AWS_IAM`
+  inbound auth). The VM reaches it via the already-baked `mcp-proxy-for-aws`,
+  SigV4-signed with the execution role from IMDS — no API keys, and queries
+  stay inside AWS. `mount-home.sh` registers it as the `web-search` MCP server
+  in each user's `~/.claude.json` on every mount.
 - **SAM template** (`template.yaml`) — VPC + security group, the S3 buckets
   (frontend / artifacts / workspace), the S3 Files filesystem + mount targets,
   the Cognito pool + authorizer, IAM roles, the token Lambda + API Gateway,
-  CloudFront, and a Lambda Network Connector for VPC egress to the S3 Files
-  mount targets. One `sam deploy` provisions all of it.
+  CloudFront, a Lambda Network Connector for VPC egress to the S3 Files
+  mount targets, and the AgentCore web-search gateway. One `sam deploy`
+  provisions all of it.
 
 **Per-user isolation:** each Cognito user gets their own MicroVM and their own
 home directory (an S3 Files access point scoped to their `sub`). Adding a user
 in the pool is all it takes — their first login provisions their VM and home on
 demand.
 
-Default model is **Claude Opus 4.8** on Bedrock; `/model` switches to Fable 5,
+Default model is **Claude Opus 5** on Bedrock; `/model` switches to Fable 5,
 Sonnet 5, or Haiku 4.5 (Fable requires US data residency, hence Opus as the
 portable default).
 
@@ -76,7 +88,7 @@ portable default).
 ## Prerequisites
 
 - An AWS account with **Bedrock model access enabled** for whichever Claude
-  models you want to use. The default is Opus 4.8, but it runs on any Bedrock
+  models you want to use. The default is Opus 5, but it runs on any Bedrock
   Claude model — enable Haiku 4.5 alone if you want the cheapest option, and set
   it as the default (see `microvm/terminal.js` / the seeded shell config).
 - **AWS Lambda MicroVMs** available in your region (this project uses
@@ -180,6 +192,7 @@ EXECUTION_ROLE=$(out ExecutionRoleArn)
 ARTIFACT_BUCKET=$(out ArtifactBucketName)
 NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
 S3_FILES_FS_ID=$(out S3FilesFileSystemId)   # the stack created this in Stage 1
+WEBSEARCH_GATEWAY_URL=$(out WebSearchGatewayUrl)   # AgentCore web-search MCP endpoint
 
 # 3a. Package the image source (substitute the FS ID placeholder first) and upload.
 sed "s|__S3_FILES_FS_ID__|$S3_FILES_FS_ID|" microvm/Dockerfile > /tmp/Dockerfile.built
@@ -203,7 +216,7 @@ aws lambda-microvms create-microvm-image \
   --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/ipad-claude-microvm.zip\"}" \
   --additional-os-capabilities '["ALL"]' \
   --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180,"validate":"ENABLED","validateTimeoutInSeconds":300},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}' \
-  --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+  --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\",\"WEBSEARCH_GATEWAY_URL\":\"$WEBSEARCH_GATEWAY_URL\"}" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION"
 
 # Wait until the image state is CREATED (poll get-microvm-image); ~5-10 min.
@@ -347,6 +360,9 @@ a few things still warrant care before you point it at anything sensitive:
   your sandbox needs before using it anywhere real.
 - **Bedrock spend.** VMs can call Bedrock freely; there's no per-user budget cap
   wired in. Add one if runaway usage is a concern.
+- **Web search spend.** AgentCore Web Search is billed per query (~$7 per 1,000
+  at time of writing) and, like Bedrock, has no per-user cap wired in. The
+  gateway is shared across all users' VMs.
 - **No network isolation of the workload.** MicroVMs have open outbound internet
   by default.
 
@@ -419,6 +435,7 @@ microvm/              MicroVM image
   hooks.js            lifecycle hooks — mounts the per-user home on /run;
                       /validate exercises the cold path for platform prefetch
   mount-home.sh       per-user S3 Files mount (-o accesspoint)
+  mcp-config.js       registers the AgentCore web-search MCP server in ~/.claude.json
   terminal.js         WebSocket PTY server (ttyd protocol)
   zshrc / bashrc      seeded shell config
 scripts/
