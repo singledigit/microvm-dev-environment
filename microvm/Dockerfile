@@ -73,6 +73,14 @@ RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/pyth
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
+# Kiro CLI — standalone binary (aarch64 Linux). Installed to /usr/local/bin so
+# it's on PATH for all users. Auth is device-flow: user runs `kiro-cli login`
+# once, opens the URL in their browser, and the session persists in ~/.local on
+# their NFS home. Auto-update is disabled (system FS doesn't persist); users can
+# re-run the installer from their home if they want a newer version.
+RUN curl -fsSL https://cli.kiro.dev/install | INSTALL_DIR=/usr/local/bin bash \
+    && kiro-cli settings "app.disableAutoupdates" "true" 2>/dev/null || true
+
 # App infrastructure lives at /opt/app — never shadowed by the S3 mount
 WORKDIR /opt/app
 RUN npm init -y && npm install node-pty ws && npm cache clean --force
