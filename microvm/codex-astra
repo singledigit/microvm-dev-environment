@@ -1,0 +1,7 @@
+#!/bin/sh
+# Convenience entry point for a new Codex session pinned to GPT-6 Astra.
+# The `codex` command instead leaves the current Bedrock catalog available
+# through `/model`.
+set -eu
+
+exec /usr/local/bin/codex -m openai.gpt-6-astra "$@"

@@ -59,6 +59,15 @@ for attempt in 1 2 3 4 5 6; do
         && chown 1000:1000 "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
         || echo "mount-home: CLAUDE.md refresh failed" >> /tmp/hooks.log
     fi
+    # Codex uses its own documented instruction location. Refresh only this
+    # image-owned artifact, leaving all user configuration, projects,
+    # histories, and login state untouched.
+    if [ -f "$SKEL/.codex/AGENTS.md" ]; then
+      mkdir -p "$MOUNT_PATH/.codex" 2>>/tmp/hooks.log || true
+      cp "$SKEL/.codex/AGENTS.md" "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
+        && chown 1000:1000 "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
+        || echo "mount-home: Codex AGENTS.md refresh failed" >> /tmp/hooks.log
+    fi
     # Register/refresh the image-owned AgentCore web-search MCP server in the
     # user's Claude config (preserves their other servers/settings). Also
     # image-owned, so a redeploy's gateway URL reaches existing homes. Skips

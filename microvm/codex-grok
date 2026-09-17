@@ -1,0 +1,10 @@
+#!/bin/sh
+# Start Codex with Grok 4.6 through the existing Amazon Bedrock provider.
+# Grok does not support Codex's native web_search tool; the workspace-web-search
+# MCP server remains available for current-information requests.
+set -eu
+
+exec /usr/local/bin/codex \
+  -c 'web_search = "disabled"' \
+  -m xai.grok-4.6 \
+  "$@"

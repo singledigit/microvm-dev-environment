@@ -1,0 +1,10 @@
+#!/bin/sh
+# Codex uses Bedrock Mantle, where GPT-6 Astra is currently available in
+# us-west-2. The rest of the workspace infrastructure remains in us-east-1.
+exec /opt/codex/node_modules/.bin/codex \
+  --dangerously-bypass-approvals-and-sandbox \
+  -c 'mcp_optional_startup_grace_ms = 5000' \
+  -c 'model_provider = "amazon-bedrock"' \
+  -c 'model_providers.amazon-bedrock.aws.region = "us-west-2"' \
+  -c 'model_providers.amazon-bedrock.aws.wire_api = "responses"' \
+  "$@"

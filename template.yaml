@@ -411,6 +411,22 @@ Resources:
                   - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-*
                   - arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-*
                   - arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-*
+              # Codex 0.154 provides the current Bedrock picker: GPT-6 Astra
+              # and the GPT-5.6 Sol, Terra, and Luna family. Keep each active
+              # US inference profile and its regional foundation-model routes
+              # explicit so the grant remains useful if PowerUserAccess is
+              # replaced with least-privilege policies later.
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.openai.gpt-6-astra"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.openai.gpt-5.6-*"
+                  - arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-6-astra
+                  - arn:aws:bedrock:us-east-2::foundation-model/openai.gpt-6-astra
+                  - arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-6-astra
+                  - arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-5.6-*
+                  - arn:aws:bedrock:us-east-2::foundation-model/openai.gpt-5.6-*
+                  - arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-5.6-*
               - Effect: Allow
                 Action: [s3files:ClientMount, s3files:ClientWrite]
                 Resource: "*"

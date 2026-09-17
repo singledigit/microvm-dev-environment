@@ -70,8 +70,15 @@ RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/pyth
     && /opt/uv/bin/uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 \
     && chown -R 1000:1000 /opt/uv
 
-# Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
+# Coding CLIs. Claude Code is globally installed; Codex is pinned under /opt so
+# the system-owned wrapper below can invoke a stable binary path. Each user's
+# configuration, history, and project state remain in their mounted S3 Files
+# home directory. Codex 0.154.0 adds GPT-6 Astra to both the Amazon Bedrock
+# catalog and interactive model picker.
+RUN npm install -g @anthropic-ai/claude-code \
+    && npm install --prefix /opt/codex --omit=dev @openai/codex@0.154.0 \
+    && /opt/codex/node_modules/.bin/codex --version \
+    && npm cache clean --force
 
 # Kiro CLI — standalone binary (aarch64 Linux). Installed to /usr/local/bin so
 # it's on PATH for all users. Auth is device-flow: user runs `kiro-cli login`
@@ -89,8 +96,11 @@ COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
 COPY mount-home.sh /opt/app/mount-home.sh
 COPY mcp-config.js /opt/app/mcp-config.js
+COPY codex /usr/local/bin/codex
+COPY codex-astra /usr/local/bin/codex-astra
+COPY codex-grok /usr/local/bin/codex-grok
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.
@@ -111,10 +121,11 @@ RUN [ -e /bin/bash ] || ln -s /usr/bin/bash /bin/bash; \
     true
 
 # Seed defaults — copied into /home/coder on first S3 mount (empty filesystem)
-RUN mkdir -p /etc/skel-coder/.claude/skills
+RUN mkdir -p /etc/skel-coder/.claude/skills /etc/skel-coder/.codex
 COPY zshrc /etc/skel-coder/.zshrc
 COPY bashrc /etc/skel-coder/.bashrc
 COPY skills/ /etc/skel-coder/.claude/skills/
+COPY codex-briefing.md /etc/skel-coder/.codex/AGENTS.md
 
 RUN cat > /etc/skel-coder/.claude.json <<'EOF'
 {
