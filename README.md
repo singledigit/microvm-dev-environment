@@ -1,11 +1,14 @@
-# iPad Claude Code
+# iPad Developer Workspace
 
 A browser-based terminal — built for the iPad, works anywhere — that runs
-[Claude Code](https://www.anthropic.com/claude-code) inside an **AWS Lambda
+[Claude Code](https://www.anthropic.com/claude-code),
+[Codex CLI](https://developers.openai.com/codex/cli/), and
+[Kiro CLI](https://kiro.dev/docs/cli/setup.md) inside an **AWS Lambda
 MicroVM**, with a persistent home directory backed by **Amazon S3**. Open a URL,
-log in, and you're in a real shell with Claude Code running against Amazon
-Bedrock. Close the tab and come back later — your files, history, and installed
-tools are still there.
+log in, and work with any of the three CLIs in a real shell. Claude Code and
+Codex run against Amazon Bedrock (no API keys); Kiro CLI is a separate hosted
+service each user signs into with their own account. Close the tab and come
+back later — your files, history, and each CLI's login state are still there.
 
 > ⚠️ **This is a demo / small-team project, not a hardened product.** Auth is
 > Cognito (admin-created users, per-user MicroVMs), but the sandbox runs with a
@@ -24,7 +27,7 @@ flowchart TD
     COG["Cognito<br/>(User Pool)"]
     APIGW["API Gateway<br/>(Cognito Authorizer)"]
     TOKENFN["Token Lambda<br/>(find/create home,<br/>launch/resume VM,<br/>mint auth token)"]
-    MVM["Per-User MicroVM<br/>(Claude Code + zsh)"]
+    MVM["Per-User MicroVM<br/>(Claude Code, Codex, Kiro + zsh)"]
     S3FILES[("S3 Files<br/>(/home/coder)<br/>per-user access point")]
     ACGW["AgentCore Gateway<br/>(AWS_IAM inbound)"]
     WEBSEARCH[("Web Search<br/>(Amazon-managed index)")]
@@ -56,17 +59,22 @@ flowchart TD
   launches or resumes **that user's own MicroVM**, and mints a short-lived auth
   token. Hand-rolled SigV4, so it's immune to AWS CLI command-name churn.
 - **MicroVM image** — Amazon Linux 2023 + Node, Python 3.13, the AWS CLI, `uv`,
-  and Claude Code (pointed at Bedrock). `terminal.js` is a WebSocket PTY server.
+  Claude Code, Codex CLI, and Kiro CLI. `terminal.js` is a WebSocket PTY server.
+  `claude` defaults to Opus 5, `claude-model` selects any current Claude family
+  model, and Codex uses Amazon Bedrock's current supported OpenAI catalog. The
+  image refreshes a managed MicroVM briefing for each CLI after the user's home
+  mount, without replacing CLI history, preferences, or Kiro login state.
   The per-user home is mounted at run time by the `/run` lifecycle hook (which
   receives the access-point id in its payload) — `mount -o accesspoint=<id>` —
   so each user gets an isolated `/home/coder` that persists across restarts.
 - **Web search** — native WebSearch/WebFetch aren't available on Bedrock, so
-  the in-VM Claude gets web search through **Amazon Bedrock AgentCore**: the
-  managed `web-search` connector behind an AgentCore Gateway (MCP, `AWS_IAM`
-  inbound auth). The VM reaches it via the already-baked `mcp-proxy-for-aws`,
-  SigV4-signed with the execution role from IMDS — no API keys, and queries
-  stay inside AWS. `mount-home.sh` registers it as the `web-search` MCP server
-  in each user's `~/.claude.json` on every mount.
+  each in-VM CLI gets managed web search through **Amazon Bedrock AgentCore**:
+  the `workspace-web-search` MCP server uses the managed `web-search` connector
+  behind an AgentCore Gateway (`AWS_IAM` inbound auth). The VM reaches it via
+  the already-baked `mcp-proxy-for-aws`, SigV4-signed with the execution role
+  from IMDS — no API keys, and queries stay inside AWS. `mount-home.sh` refreshes
+  only this image-owned MCP entry for Claude, Codex, and Kiro while preserving
+  their unrelated user configuration.
 - **SAM template** (`template.yaml`) — VPC + security group, the S3 buckets
   (frontend / artifacts / workspace), the S3 Files filesystem + mount targets,
   the Cognito pool + authorizer, IAM roles, the token Lambda + API Gateway,
@@ -79,23 +87,77 @@ home directory (an S3 Files access point scoped to their `sub`). Adding a user
 in the pool is all it takes — their first login provisions their VM and home on
 demand.
 
-Default model is **Claude Opus 5** on Bedrock; `/model` switches to Fable 5,
-Sonnet 5, or Haiku 4.5 (Fable requires US data residency, hence Opus as the
-portable default).
+Claude Code defaults to **Claude Opus 5**. Use `claude-model opus`,
+`claude-model sonnet`, `claude-model haiku`, or `claude-model fable` for the
+latest available model in each Claude family. Codex `0.154.0` uses Amazon
+Bedrock's current OpenAI catalog: GPT-6 Astra plus GPT-5.6 Sol, Terra, and
+Luna. Use `/model` in Codex to switch, or start `codex-astra` for a new
+Astra session or `codex-grok` for Grok 4.6 through Bedrock. The workspace
+control plane stays in `us-east-1`, while Codex routes its Mantle requests to
+`us-west-2`, where Astra and Grok are available. Kiro CLI needs a one-time
+device-flow login (`kiro-cli login` — see below) before use; once signed in,
+start it with `kiro-cli`. All three tools share workspace files while
+retaining their own configuration, history, and login state under
+`/home/coder`.
+
+### Signing in to Kiro CLI
+
+Kiro CLI isn't part of this app's AWS account or Bedrock — it's a separate
+hosted service, so each user authenticates with their own Kiro account. The
+browser terminal has no local browser for Kiro to launch, so it falls back to
+its **device-flow** login automatically:
+
+```
+kiro-cli login
+```
+
+This prints a URL and a one-time code — no port-forwarding or local browser
+needed. Open that URL in **any** browser (your phone, another tab, whatever's
+on hand), sign in (GitHub, Google, AWS Builder ID, IAM Identity Center, or an
+external IdP), and enter the code. Once approved, the session is stored under
+`~/.kiro` in that user's S3 Files-backed home, so it's a **one-time step per
+user** — it survives VM restarts and recycles, not just the current session.
+Check status any time with `kiro-cli whoami`; re-run `kiro-cli login` if a
+session expires.
+
+Kiro's own web-search MCP wiring, steering file, and permissions are
+image-managed the same way as Claude's and Codex's (see "Web search" above) —
+login is the only thing a user has to do by hand.
+
+On each newly mounted workspace, a background refresh runs the official `aws
+configure agent-toolkit --yes` workflow under the workspace user. It installs
+the latest default AWS skills and configures the AWS MCP server for Claude,
+Codex, and Kiro. The image then refreshes the official `aws-core` plugin for
+Claude and Codex. The refresh records progress in
+`~/.agent-toolkit-status`; it does not touch user projects, API keys, or Kiro
+login state.
+
+All three CLIs are configured for unattended work inside this dedicated
+MicroVM. Claude Code uses `bypassPermissions`; Codex bypasses approvals and its
+local sandbox; Kiro has a persistent allow-all policy. The MicroVM remains the
+isolation boundary, and Agent Toolkit safety hooks can still block protected
+operations.
 
 ---
 
 ## Prerequisites
 
-- An AWS account with **Bedrock model access enabled** for whichever Claude
-  models you want to use. The default is Opus 5, but it runs on any Bedrock
-  Claude model — enable Haiku 4.5 alone if you want the cheapest option, and set
-  it as the default (see `microvm/terminal.js` / the seeded shell config).
+- An AWS account with **Bedrock model access enabled** in **`us-east-1`** for
+  the current Claude family, and in **`us-west-2`** (Bedrock Mantle — where the
+  `codex` wrapper points model calls) for the OpenAI models Codex uses (GPT-6
+  Astra, GPT-5.6 Sol/Terra/Luna) and for xAI's Grok 4.6 (`codex-grok`). The
+  deployed image pins Codex `0.154.0`, which includes Astra in the Amazon
+  Bedrock model picker.
+- **Kiro CLI needs its own account**, unrelated to this AWS account or
+  Bedrock — it's a hosted service. Each user signs in themselves on first use;
+  see [Signing in to Kiro CLI](#signing-in-to-kiro-cli) below.
 - **AWS Lambda MicroVMs** available in your region (this project uses
   `us-east-1`). MicroVMs are a newer capability — make sure your account/region
   has access.
 - Local tooling: **AWS CLI v2**, the **AWS SAM CLI**, and **Node.js 20+**. Docker
   is *not* required — the MicroVM image is built server-side by the build service.
+  Inside the workspace, `kiro-cli login` performs its one-time device-flow login;
+  its persisted session remains in the user's S3 Files-backed home.
 
 The SAM stack provisions everything, including the **S3 Files filesystem** and
 its VPC mount targets (the persistent per-user `/home/coder`). You don't create
@@ -430,14 +492,44 @@ functions/
   token-vend/         token-vending Lambda (SigV4, Cognito sub, MicroVM lifecycle)
 frontend/index.html   the xterm.js terminal + Cognito login screen
 microvm/              MicroVM image
-  Dockerfile          AL2023 + Node/Python/uv/AWS CLI/Claude Code
+  Dockerfile          AL2023 + Node/Python/uv/AWS CLI + Claude Code, Codex, Kiro CLI
   entrypoint.sh       starts hooks.js + terminal.js
   hooks.js            lifecycle hooks — mounts the per-user home on /run;
                       /validate exercises the cold path for platform prefetch
-  mount-home.sh       per-user S3 Files mount (-o accesspoint)
-  mcp-config.js       registers the AgentCore web-search MCP server in ~/.claude.json
+  mount-home.sh       per-user S3 Files mount (-o accesspoint); refreshes every
+                      image-owned CLI config below on every mount
   terminal.js         WebSocket PTY server (ttyd protocol)
   zshrc / bashrc      seeded shell config
+  skills/             seeded Claude Code skills
+
+  # Web search (all three CLIs, via the AgentCore gateway)
+  mcp-config.js            registers the web-search MCP server into a JSON
+                            config — used for ~/.claude.json (Claude) and
+                            ~/.kiro/settings/mcp.json (Kiro)
+  codex-mcp-config.sh      registers the same server for Codex
+                            (~/.codex/config.toml) with a hardlink-safe uv cache
+
+  # Claude Code
+  claude-model             picks the latest model in a family (opus/sonnet/
+                            haiku/fable) and launches `claude`
+  claude-settings-config.js  refreshes bypassPermissions without touching the
+                            user's other settings/plugins
+
+  # Codex CLI
+  codex                    default wrapper — unattended, Bedrock Mantle (us-west-2)
+  codex-astra              Codex session pinned to GPT-6 Astra
+  codex-grok               Codex session pinned to Grok 4.6 (native web_search
+                            off; workspace-web-search MCP covers current info)
+  codex-briefing.md        Codex's image-managed AGENTS.md briefing
+
+  # Kiro CLI
+  kiro-microvm.md          Kiro's image-managed steering file
+  kiro-permissions.yaml    Kiro's unattended, allow-all permissions (the VM
+                            itself is the isolation boundary)
+
+  # Shared
+  agent-toolkit-bootstrap.sh  runs `aws configure agent-toolkit --yes` and
+                            refreshes the aws-core plugin for Claude + Codex
 scripts/
   deploy.sh           end-to-end deploy (SAM + frontend + image + smoke test)
 tools/                optional break-glass utilities for a running MicroVM
