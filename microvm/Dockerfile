@@ -63,11 +63,15 @@ ENV UV_INSTALL_DIR=/opt/uv/bin \
     UV_TOOL_DIR=/opt/uv/tool \
     UV_TOOL_BIN_DIR=/opt/uv/toolbin \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python
+# Pre-warm the exact proxy packages used by the workspace MCP configuration.
+# `mcp-proxy-for-aws@latest` is the Agent Toolkit AWS MCP server; the pinned
+# 1.6.3 package fronts the AgentCore web-search gateway.
 RUN mkdir -p /opt/uv/bin /opt/uv/cache /opt/uv/tool /opt/uv/toolbin /opt/uv/python \
     && curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/opt/uv/bin sh \
     && ln -sf /opt/uv/bin/uv /usr/local/bin/uv \
     && ln -sf /opt/uv/bin/uvx /usr/local/bin/uvx \
     && /opt/uv/bin/uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 \
+    && /opt/uv/bin/uvx mcp-proxy-for-aws@latest --help >/dev/null 2>&1 \
     && chown -R 1000:1000 /opt/uv
 
 # Coding CLIs. Claude Code is globally installed; Codex is pinned under /opt so
@@ -99,13 +103,15 @@ COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
 COPY mount-home.sh /opt/app/mount-home.sh
 COPY mcp-config.js /opt/app/mcp-config.js
+COPY claude-settings-config.js /opt/app/claude-settings-config.js
 COPY codex-mcp-config.sh /opt/app/codex-mcp-config.sh
+COPY agent-toolkit-bootstrap.sh /opt/app/agent-toolkit-bootstrap.sh
 COPY codex /usr/local/bin/codex
 COPY codex-astra /usr/local/bin/codex-astra
 COPY codex-grok /usr/local/bin/codex-grok
 COPY claude-model /usr/local/bin/claude-model
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /opt/app/codex-mcp-config.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /opt/app/codex-mcp-config.sh /opt/app/agent-toolkit-bootstrap.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.

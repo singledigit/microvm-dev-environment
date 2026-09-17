@@ -59,9 +59,14 @@ for attempt in 1 2 3 4 5 6; do
         && chown 1000:1000 "$MOUNT_PATH/.claude/CLAUDE.md" 2>>/tmp/hooks.log \
         || echo "mount-home: CLAUDE.md refresh failed" >> /tmp/hooks.log
     fi
-    # Codex uses its own documented instruction location. Refresh only this
-    # image-owned artifact, leaving all user configuration, projects,
-    # histories, and login state untouched.
+    # Persist the unattended Claude Code mode while preserving all other user
+    # settings, including plugins installed by the Agent Toolkit.
+    node /opt/app/claude-settings-config.js "$MOUNT_PATH/.claude/settings.json" >> /tmp/hooks.log 2>&1 \
+      && chown 1000:1000 "$MOUNT_PATH/.claude/settings.json" 2>>/tmp/hooks.log \
+      || echo "mount-home: Claude permissions refresh failed" >> /tmp/hooks.log
+    # Codex and Kiro use their own documented instruction locations. Refresh
+    # only these image-owned artifacts, leaving all user configuration,
+    # projects, histories, and device-flow login state untouched.
     if [ -f "$SKEL/.codex/AGENTS.md" ]; then
       mkdir -p "$MOUNT_PATH/.codex" 2>>/tmp/hooks.log || true
       cp "$SKEL/.codex/AGENTS.md" "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
@@ -94,6 +99,10 @@ for attempt in 1 2 3 4 5 6; do
       /opt/app/codex-mcp-config.sh "$MOUNT_PATH" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
         || echo "mount-home: Codex web-search MCP register failed" >> /tmp/hooks.log
     fi
+    # The latest Agent Toolkit is user-scoped because it installs skills and
+    # agent configuration in this mounted home. Refresh asynchronously so a
+    # network update cannot delay terminal readiness.
+    nohup /opt/app/agent-toolkit-bootstrap.sh "$MOUNT_PATH" >> /tmp/hooks.log 2>&1 &
     MOUNTED=true
     break
   fi
