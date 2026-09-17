@@ -25,11 +25,13 @@ const SHELL_ENV = {
   SHELL: '/usr/bin/zsh',
   CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_REGION: 'us-east-1',
-  // Default model: Opus. Fable available via /model us.anthropic.claude-fable-5.
+  // Current Claude family defaults. Use `claude-model` to select a family
+  // explicitly without changing a user's persisted Claude configuration.
   ANTHROPIC_MODEL: 'us.anthropic.claude-opus-5',
   ANTHROPIC_DEFAULT_OPUS_MODEL: 'us.anthropic.claude-opus-5',
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'us.anthropic.claude-sonnet-5',
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  ANTHROPIC_DEFAULT_FABLE_MODEL: 'us.anthropic.claude-fable-5-1',
   ANTHROPIC_SMALL_FAST_MODEL: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
   // uv/uvx state on the hardlink-capable system FS (NFS home rejects hardlinks),
   // so the AWS toolkit's uvx-launched MCP proxy runs from the warmed /opt cache.

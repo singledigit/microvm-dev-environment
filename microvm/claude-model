@@ -1,0 +1,24 @@
+#!/bin/sh
+# Launch Claude Code with one of the current Claude family models available
+# through this workspace's US Bedrock inference profiles.
+set -eu
+
+if [ "$#" -eq 0 ]; then
+  echo 'Usage: claude-model {opus|sonnet|haiku|fable} [Claude Code arguments...]' >&2
+  exit 64
+fi
+
+case "$1" in
+  opus)   model='us.anthropic.claude-opus-5' ;;
+  sonnet) model='us.anthropic.claude-sonnet-5' ;;
+  haiku)  model='us.anthropic.claude-haiku-4-5-20251001-v1:0' ;;
+  fable)  model='us.anthropic.claude-fable-5-1' ;;
+  *)
+    echo "Unknown Claude model: $1" >&2
+    echo 'Choose opus, sonnet, haiku, or fable.' >&2
+    exit 64
+    ;;
+esac
+shift
+
+exec env ANTHROPIC_MODEL="$model" claude "$@"

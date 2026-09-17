@@ -102,8 +102,9 @@ COPY mcp-config.js /opt/app/mcp-config.js
 COPY codex /usr/local/bin/codex
 COPY codex-astra /usr/local/bin/codex-astra
 COPY codex-grok /usr/local/bin/codex-grok
+COPY claude-model /usr/local/bin/claude-model
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.
@@ -248,11 +249,12 @@ ENV S3_FILES_FS_ID=__S3_FILES_FS_ID__
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 # Default model: Opus (Fable requires US data residency; users may be outside US).
-# Fable available via: /model us.anthropic.claude-fable-5
+# Fable available via: /model us.anthropic.claude-fable-5-1
 ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5
 ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
 ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
 ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
+ENV ANTHROPIC_DEFAULT_FABLE_MODEL=us.anthropic.claude-fable-5-1
 ENV ANTHROPIC_SMALL_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENV DISABLE_AUTOUPDATER=1
