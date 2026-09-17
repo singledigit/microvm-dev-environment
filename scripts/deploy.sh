@@ -110,7 +110,10 @@ sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<
 # Sync updated frontend (render replaces the placeholder file in the upload dir)
 log "Syncing frontend to S3 ($FRONTEND_BUCKET)..."
 cp "$RENDERED" "$ROOT_DIR/frontend/index.html.rendered"
-aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" --profile "$PROFILE"
+aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" \
+  --cache-control "no-cache, no-store, must-revalidate" \
+  --content-type "text/html" \
+  --profile "$PROFILE"
 rm -f "$ROOT_DIR/frontend/index.html.rendered"
 
 if [ -n "$CF_DIST_ID" ]; then
