@@ -772,6 +772,13 @@ class Pane {
     this.ws = ws;
 
     ws.onopen = () => {
+      // A close/reconnect race can leave an older socket opening after a newer
+      // one has become current. It must not attach to this pane or receive the
+      // shared mount-status broadcast.
+      if (this.ws !== ws || this.closed) {
+        try { ws.close(); } catch {}
+        return;
+      }
       clearError();
       // The server replays the session's scrollback on every (re)connect — reset
       // the terminal first so the replay lands on a clean screen instead of
@@ -790,6 +797,8 @@ class Pane {
     };
 
     ws.onmessage = (event) => {
+      // Ignore output from an older connection after this pane has reattached.
+      if (this.ws !== ws || this.closed) return;
       this.lastPong = Date.now();
       // First data from the terminal server = the session is genuinely live.
       if (this.state !== 'connected' || vmState !== 'running') {
@@ -819,12 +828,17 @@ class Pane {
     };
 
     ws.onerror = (e) => {
+      if (this.ws !== ws || this.closed) return;
       console.error(`WS error [${this.id}]`, e);
       // Failed attempts while the VM boots are expected — stay calm, onclose
       // will schedule the next quiet retry.
     };
 
     ws.onclose = () => {
+      // The old socket may close after a replacement has already connected.
+      // Only the current socket can change pane state or schedule a retry.
+      if (this.ws !== ws || this.closed) return;
+      this.ws = null;
       this.stopPing();
       if (this.closed) return;
       this.state = 'disconnected';
