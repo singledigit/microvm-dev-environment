@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  iPad Claude Code — browser terminal running Claude Code in per-user AWS Lambda
-  MicroVMs, with Cognito auth and per-user S3 Files home directories.
+  Remote Developer — browser terminal running Claude Code and Codex in per-user
+  AWS Lambda MicroVMs, with Cognito auth and per-user S3 Files home directories.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout of this template:

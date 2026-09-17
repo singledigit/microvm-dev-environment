@@ -285,7 +285,7 @@ wss.on('connection', (ws) => {
         session = getSession(id);
 
         // Title frame
-        const title = 'Claude Code';
+        const title = 'rDev';
         const tb = Buffer.alloc(1 + title.length);
         tb[0] = 0x31; tb.write(title, 1);
         ws.send(tb);

@@ -6,7 +6,7 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Claude Code</title>
+  <title>rDev</title>
   <!-- deploy.sh replaces the whole APP_CONFIG line with the real config JSON -->
   <script>window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */</script>
   <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
@@ -101,6 +101,28 @@
       font-weight: 600;
       color: #f0f6fc;
       letter-spacing: 0.5px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 1px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      letter-spacing: -0.8px;
+    }
+    .brand-mark {
+      color: #58a6ff;
+      font-style: italic;
+      font-weight: 800;
+    }
+    .brand-name {
+      color: #f0f6fc;
+      font-weight: 700;
+    }
+    #login-screen .brand {
+      letter-spacing: -1.5px;
+    }
+    #login-screen .brand-name {
+      color: #58a6ff;
     }
     #header-actions {
       display: flex;
@@ -304,8 +326,8 @@
 <body>
 <!-- Login screen (shown first) -->
 <div id="login-screen">
-  <h1>Claude Code</h1>
-  <p>iPad Sandbox</p>
+  <h1 class="brand" aria-label="rDev"><span class="brand-mark">r</span><span class="brand-name">Dev</span></h1>
+  <p>Remote developer workspace</p>
   <div class="login-form">
     <input type="email" id="login-email" placeholder="Email" autocomplete="email" inputmode="email">
     <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
@@ -317,7 +339,7 @@
 <!-- Terminal app (shown after login) -->
 <div id="app" style="display:none; height:100%; height:100dvh; flex-direction:column;">
   <div id="header">
-    <h1>Claude Code</h1>
+    <h1 class="brand" aria-label="rDev"><span class="brand-mark">r</span><span class="brand-name">Dev</span></h1>
     <div id="header-actions">
       <button class="hdr-btn" id="copy-btn" onclick="openCopyOverlay()" title="Select — view terminal text for copying">⧉</button>
       <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste clipboard into the terminal">⌘V</button>
