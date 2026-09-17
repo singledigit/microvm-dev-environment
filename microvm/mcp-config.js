@@ -1,15 +1,15 @@
-// Merge the image-owned AgentCore web-search MCP server into the user's
-// ~/.claude.json, preserving any other servers / settings they've added.
+// Merge the image-owned AgentCore web-search MCP server into a JSON-based
+// user configuration, preserving every unrelated server and top-level setting.
 //
-// Called by mount-home.sh on EVERY mount (not just first seed) so a redeploy's
-// new gateway URL reaches existing per-user homes — same "image-owned, refresh
-// every mount" contract as the CLAUDE.md briefing.
+// Used for Claude's ~/.claude.json and Kiro's ~/.kiro/settings/mcp.json. Each
+// caller owns one named record and refreshes it on every mounted workspace.
 //
-// Usage: node mcp-config.js <claude-json-path> <gateway-url>
+// Usage: node mcp-config.js <json-config-path> <gateway-url> [server-name]
 // No gateway URL (e.g. --skip-infra before the gateway exists) → no-op.
 const fs = require('fs');
+const path = require('path');
 
-const [, , configPath, gatewayUrl] = process.argv;
+const [, , configPath, gatewayUrl, serverName = 'web-search'] = process.argv;
 if (!gatewayUrl || !configPath) process.exit(0);
 
 let cfg = {};
@@ -24,7 +24,7 @@ if (!cfg.mcpServers || typeof cfg.mcpServers !== 'object') cfg.mcpServers = {};
 // self-contained. Signing service is `bedrock-agentcore`, matching AWS's own
 // AgentCore web-search example; if signing is ever rejected, the documented
 // alternative for a gateway is `agent-registry`.
-cfg.mcpServers['web-search'] = {
+cfg.mcpServers[serverName] = {
   command: 'uvx',
   args: [
     'mcp-proxy-for-aws@1.6.3',
@@ -34,5 +34,6 @@ cfg.mcpServers['web-search'] = {
   ],
 };
 
+fs.mkdirSync(path.dirname(configPath), { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
-console.log('mcp-config: web-search MCP server registered');
+console.log(`mcp-config: ${serverName} MCP server registered`);

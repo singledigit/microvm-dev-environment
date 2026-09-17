@@ -80,14 +80,19 @@ for attempt in 1 2 3 4 5 6; do
         && chown 1000:1000 "$MOUNT_PATH/.kiro/settings/permissions.yaml" 2>>/tmp/hooks.log \
         || echo "mount-home: Kiro permissions refresh failed" >> /tmp/hooks.log
     fi
-    # Register/refresh the image-owned AgentCore web-search MCP server in the
-    # user's Claude config (preserves their other servers/settings). Also
-    # image-owned, so a redeploy's gateway URL reaches existing homes. Skips
-    # itself when WEBSEARCH_GATEWAY_URL is unset.
+    # Register/refresh the image-owned AgentCore web-search MCP server for all
+    # three CLIs. Each updater touches only its own named server entry and
+    # preserves the user's unrelated settings and servers.
     if [ -n "${WEBSEARCH_GATEWAY_URL:-}" ]; then
       node /opt/app/mcp-config.js "$MOUNT_PATH/.claude.json" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
         && chown 1000:1000 "$MOUNT_PATH/.claude.json" 2>>/tmp/hooks.log \
-        || echo "mount-home: web-search MCP register failed" >> /tmp/hooks.log
+        || echo "mount-home: Claude web-search MCP register failed" >> /tmp/hooks.log
+      mkdir -p "$MOUNT_PATH/.kiro/settings" 2>>/tmp/hooks.log || true
+      node /opt/app/mcp-config.js "$MOUNT_PATH/.kiro/settings/mcp.json" "$WEBSEARCH_GATEWAY_URL" "workspace-web-search" >> /tmp/hooks.log 2>&1 \
+        && chown 1000:1000 "$MOUNT_PATH/.kiro/settings/mcp.json" 2>>/tmp/hooks.log \
+        || echo "mount-home: Kiro web-search MCP register failed" >> /tmp/hooks.log
+      /opt/app/codex-mcp-config.sh "$MOUNT_PATH" "$WEBSEARCH_GATEWAY_URL" >> /tmp/hooks.log 2>&1 \
+        || echo "mount-home: Codex web-search MCP register failed" >> /tmp/hooks.log
     fi
     MOUNTED=true
     break

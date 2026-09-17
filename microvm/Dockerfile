@@ -99,12 +99,13 @@ COPY hooks.js /opt/app/hooks.js
 COPY terminal.js /opt/app/terminal.js
 COPY mount-home.sh /opt/app/mount-home.sh
 COPY mcp-config.js /opt/app/mcp-config.js
+COPY codex-mcp-config.sh /opt/app/codex-mcp-config.sh
 COPY codex /usr/local/bin/codex
 COPY codex-astra /usr/local/bin/codex-astra
 COPY codex-grok /usr/local/bin/codex-grok
 COPY claude-model /usr/local/bin/claude-model
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
+RUN chmod +x /entrypoint.sh /opt/app/mount-home.sh /opt/app/codex-mcp-config.sh /usr/local/bin/codex /usr/local/bin/codex-astra /usr/local/bin/codex-grok /usr/local/bin/claude-model
 
 # App user — NO -m flag: /home/coder must be empty so S3 Files can mount over it.
 # zsh is the login shell.
