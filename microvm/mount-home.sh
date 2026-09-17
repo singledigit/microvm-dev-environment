@@ -68,6 +68,18 @@ for attempt in 1 2 3 4 5 6; do
         && chown 1000:1000 "$MOUNT_PATH/.codex/AGENTS.md" 2>>/tmp/hooks.log \
         || echo "mount-home: Codex AGENTS.md refresh failed" >> /tmp/hooks.log
     fi
+    if [ -f "$SKEL/.kiro/steering/microvm.md" ]; then
+      mkdir -p "$MOUNT_PATH/.kiro/steering" 2>>/tmp/hooks.log || true
+      cp "$SKEL/.kiro/steering/microvm.md" "$MOUNT_PATH/.kiro/steering/microvm.md" 2>>/tmp/hooks.log \
+        && chown 1000:1000 "$MOUNT_PATH/.kiro/steering/microvm.md" 2>>/tmp/hooks.log \
+        || echo "mount-home: Kiro steering refresh failed" >> /tmp/hooks.log
+    fi
+    if [ -f "$SKEL/.kiro/settings/permissions.yaml" ]; then
+      mkdir -p "$MOUNT_PATH/.kiro/settings" 2>>/tmp/hooks.log || true
+      cp "$SKEL/.kiro/settings/permissions.yaml" "$MOUNT_PATH/.kiro/settings/permissions.yaml" 2>>/tmp/hooks.log \
+        && chown 1000:1000 "$MOUNT_PATH/.kiro/settings/permissions.yaml" 2>>/tmp/hooks.log \
+        || echo "mount-home: Kiro permissions refresh failed" >> /tmp/hooks.log
+    fi
     # Register/refresh the image-owned AgentCore web-search MCP server in the
     # user's Claude config (preserves their other servers/settings). Also
     # image-owned, so a redeploy's gateway URL reaches existing homes. Skips

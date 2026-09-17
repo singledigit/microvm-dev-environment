@@ -1,0 +1,7 @@
+# Image-managed permissions for this dedicated, per-user MicroVM.
+# The MicroVM is the isolation boundary; Kiro CLI may execute supported tools
+# without confirmation inside it. Agent Toolkit safety hooks can still block
+# protected operations.
+rules:
+  - capability: all
+    effect: allow

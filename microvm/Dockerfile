@@ -80,13 +80,16 @@ RUN npm install -g @anthropic-ai/claude-code \
     && /opt/codex/node_modules/.bin/codex --version \
     && npm cache clean --force
 
-# Kiro CLI — standalone binary (aarch64 Linux). Installed to /usr/local/bin so
-# it's on PATH for all users. Auth is device-flow: user runs `kiro-cli login`
-# once, opens the URL in their browser, and the session persists in ~/.local on
-# their NFS home. Auto-update is disabled (system FS doesn't persist); users can
-# re-run the installer from their home if they want a newer version.
-RUN curl -fsSL https://cli.kiro.dev/install | INSTALL_DIR=/usr/local/bin bash \
-    && kiro-cli settings "app.disableAutoupdates" "true" 2>/dev/null || true
+# Kiro CLI — standalone binaries. The installer places them under root's home
+# even when INSTALL_DIR is supplied, so move the complete CLI family to
+# /usr/local/bin in the same image layer. `kiro-cli login` then stores its
+# device-flow session under the invoking user's persistent home directory.
+RUN curl -fsSL https://cli.kiro.dev/install | bash \
+    && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
+    && install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat \
+    && install -m 0755 /root/.local/bin/kiro-cli-term /usr/local/bin/kiro-cli-term \
+    && rm -rf /root/.local/bin \
+    && (kiro-cli settings "app.disableAutoupdates" "true" 2>/dev/null || true)
 
 # App infrastructure lives at /opt/app — never shadowed by the S3 mount
 WORKDIR /opt/app
@@ -121,11 +124,13 @@ RUN [ -e /bin/bash ] || ln -s /usr/bin/bash /bin/bash; \
     true
 
 # Seed defaults — copied into /home/coder on first S3 mount (empty filesystem)
-RUN mkdir -p /etc/skel-coder/.claude/skills /etc/skel-coder/.codex
+RUN mkdir -p /etc/skel-coder/.claude/skills /etc/skel-coder/.codex /etc/skel-coder/.kiro/steering /etc/skel-coder/.kiro/settings
 COPY zshrc /etc/skel-coder/.zshrc
 COPY bashrc /etc/skel-coder/.bashrc
 COPY skills/ /etc/skel-coder/.claude/skills/
 COPY codex-briefing.md /etc/skel-coder/.codex/AGENTS.md
+COPY kiro-microvm.md /etc/skel-coder/.kiro/steering/microvm.md
+COPY kiro-permissions.yaml /etc/skel-coder/.kiro/settings/permissions.yaml
 
 RUN cat > /etc/skel-coder/.claude.json <<'EOF'
 {
