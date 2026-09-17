@@ -11,22 +11,26 @@ export NPM_CONFIG_PREFIX="$HOME/.npm-global"
 [ -r /tmp/microvm-endpoint ] && export MICROVM_ENDPOINT="$(cat /tmp/microvm-endpoint)"
 export CLAUDE_CODE_USE_BEDROCK=1
 export AWS_REGION=us-east-1
-# Default model: Opus. Fable available via /model us.anthropic.claude-fable-5.
+# Latest Claude family inference profiles available in this workspace.
+# `claude-model` selects one without modifying persistent user configuration.
 export ANTHROPIC_MODEL=us.anthropic.claude-opus-5
 export ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
 export ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
+export ANTHROPIC_DEFAULT_FABLE_MODEL=us.anthropic.claude-fable-5-1
 export ANTHROPIC_SMALL_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-# uv/uvx state on the hardlink-capable system FS (NFS home rejects hardlinks).
-# Lets the AWS toolkit's `uvx`-launched MCP proxy run from the warmed cache.
+# Codex is configured by the immutable /usr/local/bin/codex wrapper. It uses
+# the same AWS_REGION and execution role as the rest of the workspace.
+# uv/uvx state stays on the hardlink-capable system FS; the S3 Files home
+# rejects hardlinks.
 export UV_CACHE_DIR=/opt/uv/cache
 export UV_PYTHON_INSTALL_DIR=/opt/uv/python
 export UV_TOOL_DIR=/opt/uv/tool
 export UV_TOOL_BIN_DIR=/opt/uv/toolbin
 
-# Prompt: green coder@claude : blue cwd $
-PROMPT='%F{green}coder@claude%f:%F{blue}%~%f$ '
+# Prompt: green coder@workspace : blue cwd $
+PROMPT='%F{green}coder@workspace%f:%F{blue}%~%f$ '
 
 # History on the persistent home
 export HISTFILE=/home/coder/.zsh_history
@@ -36,7 +40,9 @@ setopt SHARE_HISTORY INC_APPEND_HISTORY
 
 cd /home/coder
 echo ""
-echo "  Claude Code sandbox  •  type 'claude' to start"
+echo "  Claude: type 'claude' (Opus) or 'claude-model {opus|sonnet|haiku|fable}'"
+echo "  Codex: type 'codex' then '/model', 'codex-astra', or 'codex-grok'"
+echo "  Kiro CLI: run 'kiro-cli login' once, then 'kiro-cli'"
 echo "  Workspace: /home/coder/workspace  (persistent S3 storage)"
 [ -n "$MICROVM_ID" ] && echo "  VM: $MICROVM_ID"
 echo ""
