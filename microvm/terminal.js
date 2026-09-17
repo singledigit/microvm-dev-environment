@@ -130,8 +130,10 @@ function waitForHome(cb) {
     for (const fn of waiters) fn();
   };
 
-  // Initial message
-  broadcastEveryone('\r\n\x1b[36mMounting workspace\x1b[0m');
+  // Use a single cleared line for the initial status and subsequent animation.
+  // This avoids retaining the initial text as a second scrollback line on
+  // terminals that replay output while the workspace is mounting.
+  broadcastEveryone('\r\x1b[2K\x1b[36mMounting workspace\x1b[0m');
 
   const iv = setInterval(() => {
     elapsed += 500;
