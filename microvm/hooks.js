@@ -108,6 +108,10 @@ const server = http.createServer((req, res) => {
       const child = spawn('/bin/sh', ['-c', [
         // the real session cold path
         'sudo -u coder HOME=/home/coder claude --version',
+        'sudo -u coder HOME=/home/coder codex --version',
+        'timeout 30 kiro-cli --version || true',
+        'timeout 30 kiro-cli-chat --version || true',
+        'timeout 30 kiro-cli-term --version || true',
         'bash -lc true', 'zsh -lc true || true', 'git --version',
         // the mount toolchain: a REAL mount attempt (bogus access point, so it
         // fails after exercising python3.13, the helpers, and efs-proxy — the
@@ -127,6 +131,10 @@ const server = http.createServer((req, res) => {
           'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
           'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
           'timeout 60 uvx mcp-proxy-for-aws@1.6.3 --help >/dev/null 2>&1 || true',
+        'sudo -u coder HOME=/home/coder ' +
+          'UV_CACHE_DIR=/opt/uv/cache UV_PYTHON_INSTALL_DIR=/opt/uv/python ' +
+          'UV_TOOL_DIR=/opt/uv/tool UV_TOOL_BIN_DIR=/opt/uv/toolbin ' +
+          'timeout 60 uvx mcp-proxy-for-aws@latest --help >/dev/null 2>&1 || true',
         'find /opt/uv -type f -exec cat {} + > /dev/null 2>&1 || true',
         'touch /tmp/validate-done',
       ].join('; ')], { detached: true, stdio: 'ignore' });
