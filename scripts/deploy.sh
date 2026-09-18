@@ -1,10 +1,28 @@
 #!/bin/bash
 # End-to-end deploy for ipad-claude
-# Usage: ./scripts/deploy.sh [--skip-infra] [--skip-image] [--skip-mvm] [--recreate-image]
-#   --skip-infra   reuse the existing SAM stack (skip sam build/deploy)
-#   --skip-image   reuse the existing MicroVM image (skip the image build)
+# Usage: ./scripts/deploy.sh [--skip-infra] [--skip-mvm]
+#   --skip-infra   reuse the existing SAM stack (skip sam build/deploy and the
+#                  MicroVM image entirely — frontend sync + smoke test only)
 #   --skip-mvm     skip the throwaway smoke-test VM
-#   --recreate-image  delete + recreate the image (needed to change OS capabilities)
+#
+# No project-specific config file for profile/region/account: sam build and
+# sam deploy read stack_name/region/profile from samconfig.toml on their own
+# (that's what it's for — see samconfig.toml.example). This script's own raw
+# `aws` calls (the web-search gateway, S3 uploads, the smoke test — none of
+# which are `sam` commands, so samconfig.toml doesn't apply to them) rely on
+# the SAME standard AWS CLI resolution every script does: AWS_PROFILE /
+# AWS_REGION env vars, or your default profile. Export them once, or run
+# `AWS_PROFILE=... AWS_REGION=... ./scripts/deploy.sh` — nothing here parses
+# a config file to re-derive them.
+#
+# The MicroVM image is a real CFN resource (AWS::Serverless::MicrovmImage) in
+# template.yaml, not a hand-rolled aws lambda-microvms CLI dance — its own
+# configuration (name, memory tier, capabilities, base image) lives entirely
+# as literals on that resource, not here. There's no --skip-image /
+# --recreate-image: if microvm/ hasn't changed, its content hash produces the
+# same S3 key, CodeUri comes out identical, and CloudFormation no-ops the
+# resource on its own. Changing AdditionalOsCapabilities is now a normal
+# in-place update too (the CLI required delete+recreate for that).
 set -euo pipefail
 
 # Resolve repo root from this script's location (no hardcoded path).
@@ -13,30 +31,17 @@ set -euo pipefail
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
 
-# Load deployment config. Copy config.env.example → config.env and fill it in.
-if [ ! -f "$ROOT_DIR/config.env" ]; then
-  echo "config.env not found. Copy config.env.example to config.env and set your values." >&2
-  exit 1
-fi
-set -a; . "$ROOT_DIR/config.env"; set +a
-
-PROFILE="${AWS_PROFILE:-default}"
-REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT in config.env}"
-IMAGE_NAME="${IMAGE_NAME:-remote-dev}"
-MVM_MEMORY="${MVM_MEMORY:-8192}"
-STACK_NAME="${STACK_NAME:-ipad-claude}"
+# Fixed identifier for this app's stack — matches samconfig.toml's own
+# stack_name literal (the two are independent tools/files, kept in sync by
+# hand; this rarely changes). Not a config knob.
+STACK_NAME="ipad-claude"
 
 SKIP_INFRA=false
-SKIP_IMAGE=false
 SKIP_MVM=false
-RECREATE_IMAGE=false
 for arg in "$@"; do
   case $arg in
-    --skip-infra)     SKIP_INFRA=true ;;
-    --skip-image)     SKIP_IMAGE=true ;;
-    --skip-mvm)       SKIP_MVM=true ;;
-    --recreate-image) RECREATE_IMAGE=true ;;
+    --skip-infra) SKIP_INFRA=true ;;
+    --skip-mvm)   SKIP_MVM=true ;;
   esac
 done
 
@@ -44,29 +49,131 @@ log() { echo -e "\033[1;36m▶ $*\033[0m"; }
 ok()  { echo -e "\033[1;32m✓ $*\033[0m"; }
 err() { echo -e "\033[1;31m✗ $*\033[0m" >&2; }
 
-# ── Verify AWS credentials ────────────────────────────────────────────────────
-log "Checking AWS credentials (profile: $PROFILE)..."
-CALLER=$(aws sts get-caller-identity --profile "$PROFILE" --output json)
-ACTUAL_ACCOUNT=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
-if [ "$ACTUAL_ACCOUNT" != "$ACCOUNT" ]; then
-  err "Expected account $ACCOUNT but got $ACTUAL_ACCOUNT"
-  exit 1
+# ── Show resolved AWS identity (no config-driven gate — just visual confirmation) ─
+log "Resolving AWS identity (from your default profile/env — see the header comment)..."
+CALLER=$(aws sts get-caller-identity --output json)
+CALLER_ACCOUNT=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+CALLER_ARN=$(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+ok "Authenticated as $CALLER_ARN (account $CALLER_ACCOUNT) — Ctrl+C now if that's wrong"
+
+out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text 2>/dev/null || echo ""; }
+
+# ── AgentCore web-search gateway + MicroVM image inputs ────────────────────────
+# Both MicrovmCodeUri and WebSearchGatewayUrl are inputs the MicrovmImage
+# resource needs, but neither can be computed by CloudFormation itself — the
+# gateway isn't in the template (see WebSearchGatewayRole's comment), and the
+# image's CodeUri needs a real, already-uploaded S3 object before `sam deploy`
+# can create/update the resource. So both must be resolved BEFORE the deploy
+# call, from the stack's EXISTING state (ArtifactBucketName, WebSearchGateway-
+# RoleArn don't change identity across updates). This only works when the
+# stack already exists — bootstrapping a truly first-ever deploy needs those
+# two resources (the bucket, the role) created by a preceding `sam deploy`
+# first; see the README for that one-time sequence.
+WEBSEARCH_GATEWAY_URL=""
+MICROVM_CODE_URI=""
+if [ "$SKIP_INFRA" = false ]; then
+  ARTIFACT_BUCKET=$(out ArtifactBucketName)
+  WEBSEARCH_GW_ROLE_ARN=$(out WebSearchGatewayRoleArn)
+
+  if [ -z "$ARTIFACT_BUCKET" ] || [ -z "$WEBSEARCH_GW_ROLE_ARN" ]; then
+    err "Stack '$STACK_NAME' not found (or missing outputs) — this looks like a" \
+        "first-ever deploy. See the README's bootstrap note before running" \
+        "deploy.sh: the stack needs one initial 'sam deploy' to create the" \
+        "artifact bucket and the web-search gateway role before this script's" \
+        "two-way dependency (image needs the bucket, gateway needs the role,"\
+        "both need the stack) can resolve."
+    exit 1
+  fi
+
+  log "Ensuring AgentCore web-search gateway..."
+  GATEWAY_NAME="ipadclaudewebsearch"
+  GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways \
+    --query "items[?name=='$GATEWAY_NAME'].gatewayId | [0]" --output text 2>/dev/null || echo "")
+
+  if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" = "None" ]; then
+    log "Creating AgentCore gateway '$GATEWAY_NAME'..."
+    GW_OUT=$(aws bedrock-agentcore-control create-gateway \
+      --name "$GATEWAY_NAME" \
+      --protocol-type MCP \
+      --authorizer-type AWS_IAM \
+      --role-arn "$WEBSEARCH_GW_ROLE_ARN" \
+      --output json)
+    GATEWAY_ID=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayId'])")
+    WEBSEARCH_GATEWAY_URL=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayUrl'])")
+
+    for i in $(seq 1 30); do
+      GW_STATUS=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
+        --query status --output text 2>/dev/null || echo "UNKNOWN")
+      [ "$GW_STATUS" = "READY" ] && break
+      sleep 2
+    done
+    if [ "$GW_STATUS" != "READY" ]; then
+      err "Gateway stuck in $GW_STATUS"; exit 1
+    fi
+
+    log "Adding web-search connector target..."
+    aws bedrock-agentcore-control create-gateway-target \
+      --gateway-identifier "$GATEWAY_ID" \
+      --name "websearch" \
+      --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
+      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
+      --output json > /dev/null
+
+    for i in $(seq 1 30); do
+      TGT_STATUS=$(aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$GATEWAY_ID" \
+        --query "items[0].status" --output text 2>/dev/null || echo "UNKNOWN")
+      [ "$TGT_STATUS" = "READY" ] && break
+      sleep 2
+    done
+    ok "Web-search gateway created: $GATEWAY_ID (target: $TGT_STATUS)"
+  else
+    WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
+      --query gatewayUrl --output text 2>/dev/null || echo "")
+    ok "Web-search gateway exists: $GATEWAY_ID"
+  fi
+  ok "Web-search MCP endpoint: $WEBSEARCH_GATEWAY_URL"
+
+  # ── Package the MicroVM image source and compute its content-hash S3 key ────
+  # CloudFormation only diffs property VALUES. AWS::Serverless::MicrovmImage
+  # isn't in SAM's local-file auto-upload list (unlike Function's CodeUri,
+  # which SAM content-hashes automatically) — so if this always uploaded to
+  # the SAME key, a real microvm/ change would produce an IDENTICAL CodeUri
+  # string and CloudFormation would silently skip rebuilding. Hashing the zip
+  # into the key name replicates what SAM does for Functions, by hand.
+  log "Packaging MicroVM source..."
+  BUILD_DIR="/tmp/remote-dev-microvm-build"
+  rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
+  # Render the account-specific FS id into the copy only — never commit it.
+  S3_FILES_FS_ID=$(out S3FilesFileSystemId)
+  sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
+  rm -f "$BUILD_DIR/Dockerfile.bak"
+
+  ZIP_PATH="/tmp/remote-dev-microvm.zip"
+  rm -f "$ZIP_PATH"
+  (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store" > /dev/null)
+  ZIP_HASH=$(shasum -a 256 "$ZIP_PATH" | cut -c1-16)
+  ZIP_KEY="microvm/remote-dev-microvm-${ZIP_HASH}.zip"
+  MICROVM_CODE_URI="s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+
+  aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+  ok "Source uploaded to $MICROVM_CODE_URI"
 fi
-ok "Authenticated as $(echo "$CALLER" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")"
 
-# Auth is Cognito now (no shared password). Users are admin-created in the pool;
-# see the "create a user" command printed in the summary below.
-
-# ── Infrastructure: SAM build + deploy ────────────────────────────────────────
+# ── Infrastructure + MicroVM image: SAM build + deploy ─────────────────────────
+# No --profile/--region/--stack-name here — sam reads all three from
+# samconfig.toml on its own. --parameter-overrides supplies ONLY the two
+# values that are genuinely computed above; anything else set via
+# samconfig.toml's own parameter_overrides (e.g. LoginEmail) is retained
+# unchanged by CloudFormation, since it isn't mentioned in this list.
 if [ "$SKIP_INFRA" = false ]; then
   log "Building SAM application..."
   (cd "$ROOT_DIR" && sam build --template template.yaml)
 
-  log "Deploying SAM stack '$STACK_NAME'..."
+  log "Deploying SAM stack (this includes the MicroVM image build if microvm/" \
+      "changed — CloudFormation waits for it, ~5-10 min on a real change)..."
   (cd "$ROOT_DIR" && sam deploy \
-    --stack-name "$STACK_NAME" \
-    --profile "$PROFILE" --region "$REGION" \
-    --parameter-overrides "ImageName=$IMAGE_NAME" \
+    --parameter-overrides "MicrovmCodeUri=$MICROVM_CODE_URI WebSearchGatewayUrl=$WEBSEARCH_GATEWAY_URL" \
     --no-confirm-changeset --no-fail-on-empty-changeset)
   ok "SAM stack deployed"
 else
@@ -74,26 +181,19 @@ else
 fi
 
 # ── Read stack outputs (SAM creates a normal CloudFormation stack) ────────────
-out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-  --profile "$PROFILE" --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-
-ARTIFACT_BUCKET=$(out ArtifactBucketName)
-BUILD_ROLE=$(out BuildRoleArn)
+# TokenApiUrl/FrontendUrl/UserPoolId/LoginEmail/CreateUserCommand etc. were
+# already printed by `sam deploy` itself moments ago (when --skip-infra is
+# false) — only re-read here what deploy.sh actually NEEDS to act on: the
+# frontend sync and the smoke test.
 EXECUTION_ROLE=$(out ExecutionRoleArn)
-TOKEN_API_URL=$(out TokenApiUrl)
-FRONTEND_URL=$(out FrontendUrl)
 FRONTEND_BUCKET=$(out FrontendBucketName)
 CF_DIST_ID=$(out CloudFrontDistributionId)
 USER_POOL_ID=$(out UserPoolId)
 USER_POOL_CLIENT_ID=$(out UserPoolClientId)
+TOKEN_API_URL=$(out TokenApiUrl)
 S3_FILES_FS_ID=$(out S3FilesFileSystemId)
 NETWORK_CONNECTOR_ARN=$(out NetworkConnectorArn)
-WEBSEARCH_GW_ROLE_ARN=$(out WebSearchGatewayRoleArn)
-
-ok "Artifact bucket : $ARTIFACT_BUCKET"
-ok "Token API       : $TOKEN_API_URL"
-ok "Frontend        : $FRONTEND_URL"
+IMAGE_ID=$(out MicrovmImageArn)
 
 # ── Inject runtime config into frontend (token API + Cognito ids) ─────────────
 # index.html ships with an APP_CONFIG placeholder; fill it at deploy time. We
@@ -102,7 +202,7 @@ ok "Frontend        : $FRONTEND_URL"
 log "Injecting runtime config into frontend..."
 FRONTEND_FILE="$ROOT_DIR/frontend/index.html"
 RENDERED=/tmp/ipad-claude-index.html
-APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$REGION\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\"}"
+APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$(aws configure get region 2>/dev/null || echo us-east-1)\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\"}"
 # Replace the whole placeholder <script> line with the injected config.
 sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
   "$FRONTEND_FILE" > "$RENDERED"
@@ -112,235 +212,40 @@ log "Syncing frontend to S3 ($FRONTEND_BUCKET)..."
 cp "$RENDERED" "$ROOT_DIR/frontend/index.html.rendered"
 aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" \
   --cache-control "no-cache, no-store, must-revalidate" \
-  --content-type "text/html" \
-  --profile "$PROFILE"
+  --content-type "text/html"
 rm -f "$ROOT_DIR/frontend/index.html.rendered"
 
 if [ -n "$CF_DIST_ID" ]; then
   aws cloudfront create-invalidation \
     --distribution-id "$CF_DIST_ID" \
-    --paths "/*" \
-    --profile "$PROFILE" > /dev/null
+    --paths "/*" > /dev/null
 fi
 ok "Frontend synced and CDN invalidated"
-
-# ── AgentCore Web Search Gateway (out-of-band — CFN handler bug) ────────────────
-# The Gateway + Target are created here (not in template.yaml) because the CFN
-# resource handler for AWS::BedrockAgentCore::GatewayTarget has a serialization
-# bug with the connector's empty ParameterValues map. The role IS in the stack
-# (template.yaml), and the gateway is stable (create-once, reuse forever).
-log "Ensuring AgentCore web-search gateway..."
-GATEWAY_NAME="ipadclaudewebsearch"
-GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways \
-  --profile "$PROFILE" --region "$REGION" \
-  --query "items[?name=='$GATEWAY_NAME'].gatewayId | [0]" --output text 2>/dev/null || echo "")
-
-if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" = "None" ]; then
-  log "Creating AgentCore gateway '$GATEWAY_NAME'..."
-  GW_OUT=$(aws bedrock-agentcore-control create-gateway \
-    --name "$GATEWAY_NAME" \
-    --protocol-type MCP \
-    --authorizer-type AWS_IAM \
-    --role-arn "$WEBSEARCH_GW_ROLE_ARN" \
-    --profile "$PROFILE" --region "$REGION" --output json)
-  GATEWAY_ID=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayId'])")
-  WEBSEARCH_GATEWAY_URL=$(echo "$GW_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['gatewayUrl'])")
-
-  # Wait for READY (typically <30s)
-  for i in $(seq 1 30); do
-    GW_STATUS=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
-      --profile "$PROFILE" --region "$REGION" --query status --output text 2>/dev/null || echo "UNKNOWN")
-    [ "$GW_STATUS" = "READY" ] && break
-    sleep 2
-  done
-  if [ "$GW_STATUS" != "READY" ]; then
-    err "Gateway stuck in $GW_STATUS"; exit 1
-  fi
-
-  log "Adding web-search connector target..."
-  aws bedrock-agentcore-control create-gateway-target \
-    --gateway-identifier "$GATEWAY_ID" \
-    --name "websearch" \
-    --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
-    --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-    --profile "$PROFILE" --region "$REGION" --output json > /dev/null
-
-  # Wait for target READY
-  for i in $(seq 1 30); do
-    TGT_STATUS=$(aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$GATEWAY_ID" \
-      --profile "$PROFILE" --region "$REGION" --query "items[0].status" --output text 2>/dev/null || echo "UNKNOWN")
-    [ "$TGT_STATUS" = "READY" ] && break
-    sleep 2
-  done
-  ok "Web-search gateway created: $GATEWAY_ID (target: $TGT_STATUS)"
-else
-  WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GATEWAY_ID" \
-    --profile "$PROFILE" --region "$REGION" --query gatewayUrl --output text 2>/dev/null || echo "")
-  ok "Web-search gateway exists: $GATEWAY_ID"
-fi
-ok "Web-search MCP endpoint: $WEBSEARCH_GATEWAY_URL"
-
-# ── Build MicroVM image ────────────────────────────────────────────────────────
-if [ "$SKIP_IMAGE" = false ]; then
-  log "Packaging MicroVM source..."
-  ZIP_KEY="ipad-claude-microvm.zip"
-  rm -f /tmp/"$ZIP_KEY"
-  # Render the image source to a temp build dir so the tracked microvm/ files
-  # stay pristine (never bake the account-specific FS id into git). Only the
-  # Dockerfile's __S3_FILES_FS_ID__ placeholder is substituted. (The FS id is
-  # ALSO passed via --environment-variables at image create; the ENV line is
-  # the belt-and-suspenders copy for a plain `docker build`.)
-  BUILD_DIR="/tmp/ipad-claude-microvm-build"
-  rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
-  sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
-  rm -f "$BUILD_DIR/Dockerfile.bak"
-  (cd "$BUILD_DIR" && zip -r /tmp/"$ZIP_KEY" . -x "*.DS_Store" > /dev/null)
-  aws s3 cp /tmp/"$ZIP_KEY" "s3://$ARTIFACT_BUCKET/$ZIP_KEY" \
-    --profile "$PROFILE"
-  ok "Source uploaded to s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-
-  # GA API (create-microvm-image) takes capabilities, hooks, and env vars as
-  # SEPARATE top-level flags — NOT nested in a --runtime blob.
-  HOOKS_JSON="{
-      \"port\": 9000,
-      \"microvmImageHooks\": {
-        \"ready\": \"ENABLED\",
-        \"readyTimeoutInSeconds\": 180,
-        \"validate\": \"ENABLED\",
-        \"validateTimeoutInSeconds\": 300
-      },
-      \"microvmHooks\": {
-        \"run\":                    \"ENABLED\",
-        \"runTimeoutInSeconds\":     10,
-        \"resume\":                 \"ENABLED\",
-        \"resumeTimeoutInSeconds\":  10,
-        \"suspend\":                \"ENABLED\",
-        \"suspendTimeoutInSeconds\": 10,
-        \"terminate\":              \"ENABLED\",
-        \"terminateTimeoutInSeconds\": 10
-      }
-    }"
-
-  log "Using S3 Files filesystem: $S3_FILES_FS_ID"
-  log "Using network connector: $NETWORK_CONNECTOR_ARN"
-  log "Using web-search gateway: ${WEBSEARCH_GATEWAY_URL:-<none>}"
-
-  log "Updating MicroVM image '$IMAGE_NAME' with new version..."
-  IMAGE_ID=$(aws lambda-microvms list-microvm-images \
-    --profile "$PROFILE" --region "$REGION" \
-    --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" \
-    --output text 2>/dev/null || echo "")
-
-  # --additional-os-capabilities only applies at CREATE time; update ignores it.
-  # To change capabilities, the image must be deleted and recreated.
-  if [ "$RECREATE_IMAGE" = true ] && [ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "None" ]; then
-    log "Recreating image — terminating all per-user MVMs referencing it..."
-    # MVMs are per-user now (/ipad-claude/users/<sub>/mvm-identifier); any of
-    # them may reference the image, so terminate them all before deleting it.
-    TERMINATED=false
-    for OLD_MVM_ID in $(aws ssm get-parameters-by-path --path /ipad-claude/users --recursive \
-        --profile "$PROFILE" --region "$REGION" \
-        --query "Parameters[?ends_with(Name,'mvm-identifier')].Value" --output text 2>/dev/null); do
-      [ -z "$OLD_MVM_ID" ] || [ "$OLD_MVM_ID" = "None" ] && continue
-      aws lambda-microvms terminate-microvm --microvm-identifier "$OLD_MVM_ID" \
-        --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
-      log "Terminated $OLD_MVM_ID"
-      TERMINATED=true
-    done
-    if [ "$TERMINATED" = true ]; then
-      log "Waiting 15s for MVM termination to release the image..."
-      sleep 15
-    fi
-    aws lambda-microvms delete-microvm-image --image-identifier "$IMAGE_ID" \
-      --profile "$PROFILE" --region "$REGION" 2>&1 || true
-    # Poll until the image is gone
-    for i in $(seq 1 30); do
-      STILL=$(aws lambda-microvms list-microvm-images --profile "$PROFILE" --region "$REGION" \
-        --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" --output text 2>/dev/null || echo "None")
-      [ -z "$STILL" ] || [ "$STILL" = "None" ] && break
-      printf "\r  Waiting for image deletion... (%d/30)" "$i"; sleep 5
-    done
-    echo ""
-    IMAGE_ID=""
-    ok "Old image deleted — will create fresh"
-  fi
-
-  if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "None" ]; then
-    log "Creating new MicroVM image '$IMAGE_NAME' (with --additional-os-capabilities ALL)..."
-    CREATE_OUT=$(aws lambda-microvms create-microvm-image \
-      --name "$IMAGE_NAME" \
-      --base-image-arn "arn:aws:lambda:$REGION:aws:microvm-image:al2023-1" \
-      --build-role-arn "$BUILD_ROLE" \
-      --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
-      --additional-os-capabilities '["ALL"]' \
-      --hooks "$HOOKS_JSON" \
-      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\",\"WEBSEARCH_GATEWAY_URL\":\"$WEBSEARCH_GATEWAY_URL\"}" \
-      --profile "$PROFILE" --region "$REGION" --output json)
-    IMAGE_ID=$(echo "$CREATE_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['imageArn'])")
-  else
-    # update-microvm-image REPLACES the whole version config — capabilities, hooks,
-    # and env vars reset to defaults unless re-passed every time. Always include them.
-    log "Image '$IMAGE_NAME' exists ($IMAGE_ID), updating (re-passing capabilities)..."
-    aws lambda-microvms update-microvm-image \
-      --image-identifier "$IMAGE_ID" \
-      --base-image-arn "arn:aws:lambda:$REGION:aws:microvm-image:al2023-1" \
-      --build-role-arn "$BUILD_ROLE" \
-      --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
-      --additional-os-capabilities '["ALL"]' \
-      --hooks "$HOOKS_JSON" \
-      --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\",\"WEBSEARCH_GATEWAY_URL\":\"$WEBSEARCH_GATEWAY_URL\"}" \
-      --profile "$PROFILE" --region "$REGION" --output json > /dev/null
-  fi
-
-  ok "Image: $IMAGE_ID — waiting for build (takes ~5-10 min)..."
-  for i in $(seq 1 120); do
-    IMAGE_JSON=$(aws lambda-microvms get-microvm-image \
-      --image-identifier "$IMAGE_ID" \
-      --profile "$PROFILE" --region "$REGION" --output json 2>/dev/null || echo '{}')
-    BUILD_STATE=$(echo "$IMAGE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('state','UNKNOWN'))")
-    LATEST_VER=$(echo "$IMAGE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latestActiveImageVersion',''))")
-    if { [ "$BUILD_STATE" = "UPDATED" ] || [ "$BUILD_STATE" = "CREATED" ]; } && [ -n "$LATEST_VER" ]; then
-      ok "Image build complete: $IMAGE_ID (version $LATEST_VER)"
-      break
-    elif [[ "$BUILD_STATE" == *"FAIL"* ]]; then
-      err "Image build failed (state: $BUILD_STATE)"
-      echo "$IMAGE_JSON" >&2
-      exit 1
-    fi
-    printf "\r  Build state: %-25s (%d/120)" "$BUILD_STATE" "$i"
-    sleep 10
-  done
-  echo ""
-else
-  log "Skipping image build (--skip-image)"
-  IMAGE_ID=$(aws lambda-microvms list-microvm-images \
-    --profile "$PROFILE" \
-    --region "$REGION" \
-    --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" \
-    --output text)
-  ok "Using existing image: $IMAGE_ID"
-fi
 
 # ── Smoke-test MicroVM (throwaway) ──────────────────────────────────────────────
 # Per-user MVMs are launched on demand by the token Lambda at login (keyed to
 # the Cognito user), NOT here. This launches ONE throwaway VM purely to smoke-
-# test the freshly-built image end-to-end, then terminates it. To exercise the
-# real per-user mount path, we create a temporary access point and pass its id
-# via --run-hook-payload, exactly as the Lambda does.
+# test the image end-to-end, then terminates it. To exercise the real per-user
+# mount path, we create a temporary access point and pass its id via
+# --run-hook-payload, exactly as the Lambda does.
 SMOKE_AP=""
 if [ "$SKIP_MVM" = false ]; then
-  # Build egress connector flag
+  if [ -z "$IMAGE_ID" ]; then
+    err "No MicrovmImageArn stack output — run without --skip-infra at least once first."
+    exit 1
+  fi
+
   EGRESS_FLAG=""
   if [ -n "$NETWORK_CONNECTOR_ARN" ] && [ "$NETWORK_CONNECTOR_ARN" != "None" ]; then
     EGRESS_FLAG="--egress-network-connectors [\"$NETWORK_CONNECTOR_ARN\"]"
   fi
+  REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
 
   log "Creating throwaway access point for smoke test..."
   SMOKE_AP=$(aws s3files create-access-point \
     --file-system-id "$S3_FILES_FS_ID" \
     --posix-user 'uid=1000,gid=1000' \
     --root-directory 'path=/users/_smoketest,creationPermissions={ownerUid=1000,ownerGid=1000,permissions=0755}' \
-    --profile "$PROFILE" --region "$REGION" \
     --query 'accessPointId' --output text 2>/dev/null || echo "")
 
   log "Launching smoke-test MicroVM..."
@@ -352,8 +257,6 @@ if [ "$SKIP_MVM" = false ]; then
     --ingress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
     $EGRESS_FLAG \
     ${SMOKE_AP:+--run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}"} \
-    --profile "$PROFILE" \
-    --region "$REGION" \
     --output json 2>&1)
 
   MVM_ID=$(echo "$RUN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('microvmId',''))" 2>/dev/null || echo "")
@@ -389,8 +292,6 @@ if [ "$SKIP_MVM" = false ] && [ -n "$MVM_ID" ]; then
     --microvm-identifier "$MVM_ID" \
     --expiration-in-minutes 5 \
     --allowed-ports '[{"port":8080}]' \
-    --profile "$PROFILE" \
-    --region "$REGION" \
     --query 'authToken."X-aws-proxy-auth"' --output text 2>/dev/null || echo "")
 
   if [ -n "$SMOKE_TOKEN" ] && [ -n "$MVM_ENDPOINT" ]; then
@@ -408,36 +309,20 @@ if [ "$SKIP_MVM" = false ] && [ -n "$MVM_ID" ]; then
   # Tear down the throwaway smoke-test VM + access point — real per-user VMs
   # are launched by the token Lambda at login.
   log "Tearing down smoke-test VM..."
-  aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID" \
-    --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+  aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID" 2>/dev/null || true
   if [ -n "$SMOKE_AP" ] && [ "$SMOKE_AP" != "None" ]; then
-    aws s3files delete-access-point --access-point-id "$SMOKE_AP" \
-      --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
+    aws s3files delete-access-point --access-point-id "$SMOKE_AP" 2>/dev/null || true
   fi
   MVM_STATE="smoke-tested + torn down"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+# Deliberately short: TokenApiUrl, FrontendUrl, UserPoolId, LoginEmail, and
+# CreateUserCommand were all already printed by `sam deploy` itself above —
+# this only reports what THIS script uniquely did (the smoke test).
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Remote Developer (rDev) — Deployed Successfully"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Frontend URL : $FRONTEND_URL"
-echo "  Token API    : $TOKEN_API_URL"
-echo "  Smoke test   : $MVM_STATE"
-echo "  User pool    : $USER_POOL_ID"
-echo ""
-echo "  Auth is Cognito (admin-created users, no self-signup)."
-echo "  Create a user with a temporary password (they set a permanent one on"
-echo "  first sign-in):"
-echo ""
-echo "    aws cognito-idp admin-create-user \\"
-echo "      --user-pool-id $USER_POOL_ID \\"
-echo "      --username ${LOGIN_EMAIL:-you@example.com} \\"
-echo "      --user-attributes Name=email,Value=${LOGIN_EMAIL:-you@example.com} Name=email_verified,Value=true \\"
-echo "      --temporary-password 'ChangeMe-123!' \\"
-echo "      --profile $PROFILE --region $REGION"
-echo ""
-echo "  Then open $FRONTEND_URL and sign in with that email + temp password."
+echo "  Smoke test: $MVM_STATE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""

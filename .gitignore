@@ -6,5 +6,6 @@ node_modules/
 # SAM build artifacts
 .aws-sam/
 
-# Local deployment config — never commit (your account ID, FS ID, profile, etc.)
-config.env
+# Local SAM CLI config — never commit (your AWS profile, personalized
+# parameter_overrides, etc.). See samconfig.toml.example for the template.
+samconfig.toml

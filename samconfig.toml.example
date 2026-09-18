@@ -1,0 +1,22 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "ipad-claude"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3 = true
+region = "us-east-1"
+# Named AWS CLI profile to deploy with. Omit to use your default profile.
+# profile = "your-profile-name"
+#
+# Personalize the admin-create-user email in this stack's Outputs (cosmetic
+# only — auth is Cognito, this isn't a credential). Uncomment and set your
+# own; CloudFormation retains it on every later `./scripts/deploy.sh` run —
+# deploy.sh never reads or passes this itself, sam does.
+# parameter_overrides = "LoginEmail=\"you@example.com\""

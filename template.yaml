@@ -6,7 +6,7 @@ Description: >
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout of this template:
-#   Parameters  — deploy-time knobs (region-derived values, image name)
+#   Parameters  — values only knowable at deploy time (see the block's own comment)
 #   Networking  — VPC, NAT, subnets, NFS security group
 #   Storage     — S3 buckets + the S3 Files filesystem/mount targets
 #   Identity    — Cognito user pool + the IAM roles
@@ -22,10 +22,34 @@ Description: >
 # ─────────────────────────────────────────────────────────────────────────────
 
 Parameters:
-  ImageName:
+  # Two categories only: values genuinely unknowable until deploy time
+  # (MicrovmCodeUri, WebSearchGatewayUrl — deploy.sh computes/discovers these
+  # itself every run), and personalization knobs meant to be set once via
+  # `sam deploy --guided` or samconfig.toml's parameter_overrides, not by
+  # deploy.sh (LoginEmail). Everything else that's a fixed, non-personal
+  # choice (image name, memory tier, capabilities, base image version) is a
+  # literal directly on the MicrovmImage resource below — not a Parameter.
+  LoginEmail:
     Type: String
-    Default: remote-dev
-    Description: Name of the Lambda MicroVM image (built out-of-band by deploy.sh).
+    Default: you@example.com
+    Description: >-
+      Email for the admin-create-user command in this stack's Outputs.
+      Cosmetic — set your own once via `sam deploy --guided` or
+      samconfig.toml's parameter_overrides; CloudFormation retains it on
+      every later deploy.sh run without deploy.sh ever passing it.
+  MicrovmCodeUri:
+    Type: String
+    Description: >-
+      s3://bucket/key of the zipped microvm/ source. deploy.sh computes this
+      from a content hash of the zip on every deploy — CloudFormation only
+      diffs property VALUES, and unlike AWS::Serverless::Function this
+      resource is NOT in SAM's local-file auto-upload list, so a content
+      hash in the key is what makes a real code change actually trigger a
+      rebuild instead of silently no-op'ing against a stale key.
+  WebSearchGatewayUrl:
+    Type: String
+    Default: ""
+    Description: AgentCore web-search MCP endpoint (created out-of-band by deploy.sh; see WebSearchGatewayRole below).
 
 Globals:
   Function:
@@ -312,6 +336,70 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt ArtifactBucket.Arn
 
+  # The MicroVM image itself. Was hand-rolled via aws lambda-microvms
+  # create-microvm-image/update-microvm-image in deploy.sh — moved here once
+  # AWS::Serverless::MicrovmImage shipped (June 2026), which maps 1:1 onto
+  # those CLI flags and, crucially, fixes the CLI's worst footgun: `update-
+  # microvm-image` REPLACED the whole version config on every call, silently
+  # resetting capabilities/hooks/env vars unless you re-passed all of them
+  # every time. As an ordinary CFN resource, the full property set is always
+  # declared, that class of bug can't happen, and CloudFormation's own async
+  # stabilization replaces our manual CREATING-poll loop.
+  #
+  # BaseImageVersion and EgressNetworkConnectors below aren't arbitrary —
+  # they mirror what the CLI path was already resolving to by default
+  # (confirmed via get-microvm-image-version on the live image, which
+  # reported the resolved version as "1.0" — but this resource's input
+  # wants just the major version, "1"). Resources.MinimumMemoryInMiB is the
+  # one property deliberately NOT left at that old default: the CLI path
+  # never set it, so it silently floated at the platform default of 2048 MiB
+  # even though config.env.example used to carry an MVM_MEMORY=8192 that
+  # nothing ever actually consumed — the kind of dead, misleading config
+  # this migration is meant to make impossible. There is no config.env
+  # equivalent now; this literal IS the configuration.
+  #
+  # MinimumMemoryInMiB is a fixed-tier picker, not a free-form value —
+  # Lambda MicroVMs bill continuously at this baseline while running and
+  # auto-burst up to 4x it under load (billed per-second, only while
+  # actually bursting): 512→2048 peak, 1024→4096 peak, 2048→8192 peak,
+  # 4096→16384 peak, 8192→32768 peak. 4096 (4 GB baseline / 16 GB peak,
+  # 2 vCPU baseline / 8 vCPU peak) was chosen over the platform default of
+  # 2048 for headroom on sustained Claude Code / build workloads, without
+  # paying the 8192 tier's continuous rate for capacity mostly needed only
+  # in bursts. Change this literal directly to move tiers.
+  MicrovmImage:
+    Type: AWS::Serverless::MicrovmImage
+    Properties:
+      Name: remote-dev
+      CodeUri: !Ref MicrovmCodeUri
+      BuildRoleArn: !GetAtt MicroVmBuildRole.Arn
+      BaseImageArn: !Sub "arn:aws:lambda:${AWS::Region}:aws:microvm-image:al2023-1"
+      BaseImageVersion: "1"
+      AdditionalOsCapabilities: [ALL]
+      Resources:
+        - MinimumMemoryInMiB: 4096
+      EgressNetworkConnectors:
+        - !Sub "arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+      EnvironmentVariables:
+        S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
+        WEBSEARCH_GATEWAY_URL: !Ref WebSearchGatewayUrl
+      Hooks:
+        Port: 9000
+        MicrovmImageHooks:
+          Ready: ENABLED
+          ReadyTimeoutInSeconds: 180
+          Validate: ENABLED
+          ValidateTimeoutInSeconds: 300
+        MicrovmHooks:
+          Run: ENABLED
+          RunTimeoutInSeconds: 10
+          Resume: ENABLED
+          ResumeTimeoutInSeconds: 10
+          Suspend: ENABLED
+          SuspendTimeoutInSeconds: 10
+          Terminate: ENABLED
+          TerminateTimeoutInSeconds: 10
+
   # Permissions boundary for roles created FROM INSIDE the sandbox. The
   # execution role may create/manage IAM roles only if the new role carries
   # this boundary, and the boundary caps every such role at sandbox level —
@@ -521,7 +609,7 @@ Resources:
       Environment:
         Variables:
           ALLOWED_ORIGINS: "*"
-          IMAGE_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}"
+          IMAGE_ARN: !GetAtt MicrovmImage.ImageArn
           EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           NETWORK_CONNECTOR_ARN: !GetAtt VpcEgressConnector.Arn
           S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
@@ -692,6 +780,14 @@ Outputs:
     Value: !Ref UserPool
   UserPoolClientId:
     Value: !Ref UserPoolClient
+  LoginEmail:
+    Description: Configured via the LoginEmail parameter (samconfig.toml or --parameter-overrides).
+    Value: !Ref LoginEmail
+  CreateUserCommand:
+    Description: >-
+      Run this once to create your first login. sam deploy prints this
+      automatically — no need for deploy.sh to reconstruct it.
+    Value: !Sub "aws cognito-idp admin-create-user --user-pool-id ${UserPool} --username ${LoginEmail} --user-attributes Name=email,Value=${LoginEmail} Name=email_verified,Value=true --temporary-password 'ChangeMe-123!'"
   FrontendUrl:
     Value: !Sub "https://${FrontendDistribution.DomainName}"
   FrontendBucketName:
@@ -713,3 +809,6 @@ Outputs:
   WebSearchGatewayRoleArn:
     Description: IAM role used by the AgentCore web-search gateway (outbound connector auth).
     Value: !GetAtt WebSearchGatewayRole.Arn
+  MicrovmImageArn:
+    Description: ARN of the MicroVM image (created/updated as part of this stack).
+    Value: !GetAtt MicrovmImage.ImageArn
