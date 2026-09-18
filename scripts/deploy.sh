@@ -420,7 +420,7 @@ fi
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  iPad Claude Code — Deployed Successfully"
+echo "  Remote Developer (rDev) — Deployed Successfully"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Frontend URL : $FRONTEND_URL"
 echo "  Token API    : $TOKEN_API_URL"

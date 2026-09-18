@@ -576,7 +576,7 @@ Resources:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
-        Comment: iPad Claude Code frontend
+        Comment: Remote Developer (rDev) frontend
         Enabled: true
         DefaultRootObject: index.html
         Origins:

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Interactive shell client for a user's iPad Claude MicroVM (SHELL_INGRESS).
+// Interactive shell client for a user's rDev MicroVM (SHELL_INGRESS).
 // Usage: node tools/exec.js --user <email> [--root]
 //   (or set IPAD_CLAUDE_USER=<email> instead of --user)
 // Requires: cd tools && npm install  (installs the `ws` client)
