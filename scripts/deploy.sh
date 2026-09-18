@@ -23,7 +23,7 @@ set -a; . "$ROOT_DIR/config.env"; set +a
 PROFILE="${AWS_PROFILE:-default}"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT="${AWS_ACCOUNT:?set AWS_ACCOUNT in config.env}"
-IMAGE_NAME="${IMAGE_NAME:-ipad-claude-v2}"
+IMAGE_NAME="${IMAGE_NAME:-remote-dev}"
 MVM_MEMORY="${MVM_MEMORY:-8192}"
 STACK_NAME="${STACK_NAME:-ipad-claude}"
 
