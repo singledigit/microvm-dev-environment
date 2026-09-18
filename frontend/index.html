@@ -287,6 +287,37 @@
     }
     .pane-close:active { color: #f85149; border-color: #f85149; }
     #panes.multi .pane-close { display: block; }
+    /* Special-keys row for touch devices — see the #keybar markup comment. */
+    #keybar {
+      display: none;
+      flex-shrink: 0;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #16213e;
+      border-top: 1px solid #0f3460;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    #keybar.show { display: flex; }
+    .key-btn {
+      flex: 0 0 auto;
+      min-width: 40px;
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f3460;
+      color: #c9d1d9;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      cursor: pointer;
+    }
+    .key-btn:active { background: #1a4a8a; }
+    #ctrl-key.active { background: #58a6ff; color: #0d1117; font-weight: 700; }
     #loading {
       display: flex;
       flex-direction: column;
@@ -377,6 +408,22 @@
       <div id="loading-msg">Loading terminal…</div>
     </div>
   </div>
+  <!-- Keys the iOS software keyboard has no key for. Shown only on Apple
+       touch devices (see IS_APPLE_TOUCH) — a hardware keyboard already has
+       all of these. Ctrl is sticky: arm it, then tap a letter on the
+       keyboard to send that control code; ^C is also one tap on its own,
+       since it's the most common interrupt and shouldn't need the keyboard
+       open at all. -->
+  <div id="keybar">
+    <button class="key-btn" onclick="sendEsc()">Esc</button>
+    <button class="key-btn" onclick="sendTab()">Tab</button>
+    <button class="key-btn" id="ctrl-key" onclick="toggleCtrl()" title="Arm Ctrl, then tap a letter">Ctrl</button>
+    <button class="key-btn" onclick="sendCtrlC()" title="Send Ctrl+C">^C</button>
+    <button class="key-btn" onclick="sendArrowLeft()">←</button>
+    <button class="key-btn" onclick="sendArrowUp()">↑</button>
+    <button class="key-btn" onclick="sendArrowDown()">↓</button>
+    <button class="key-btn" onclick="sendArrowRight()">→</button>
+  </div>
   <div id="copy-overlay">
     <div id="copy-overlay-bar">
       <span>Long-press to select · text of the focused terminal</span>
@@ -402,6 +449,8 @@ const IS_APPLE_TOUCH = (/iPad|iPhone|iPod/.test(navigator.userAgent)
   && (window.matchMedia?.('(hover: none) and (pointer: coarse)').matches ?? true);
 // Dev builds inject CONFIG.build (deploy-dev.sh); production leaves it unset.
 if (CONFIG.build) document.getElementById('build-tag').textContent = CONFIG.build;
+// The on-screen keyboard has no Ctrl/Esc/Tab/arrows — only useful on touch.
+if (IS_APPLE_TOUCH) document.getElementById('keybar')?.classList.add('show');
 const MAX_PANES = 4;
 const PANES_STORAGE_KEY = 'ipad-claude-panes';
 const LAYOUT_STORAGE_KEY = 'ipad-claude-layout'; // 'stacked' (default) | 'side-by-side'
@@ -609,6 +658,54 @@ function isWarmingUp() {
 const panes = new Map(); // id -> Pane
 let focusedPane = null;
 
+// ── Special-keys row (Ctrl/Esc/Tab/arrows) ─────────────────────────────────────
+// sendRaw mirrors the encoding Pane#terminal.onData uses below, so a key-bar
+// tap and a real keystroke look identical on the wire.
+function sendRaw(pane, str) {
+  if (!pane || !pane.ws || pane.ws.readyState !== 1) return;
+  const encoded = new TextEncoder().encode(str);
+  const msg = new Uint8Array(1 + encoded.length);
+  msg[0] = 0x30;
+  msg.set(encoded, 1);
+  pane.ws.send(msg);
+}
+
+// Ctrl is sticky: arm it, then the NEXT character typed on the iOS keyboard
+// is converted to its control code instead of sent literally (see the
+// onData check in the Pane constructor below).
+let ctrlArmed = false;
+const ctrlKeyEl = document.getElementById('ctrl-key');
+function setCtrlArmed(v) {
+  ctrlArmed = v;
+  ctrlKeyEl?.classList.toggle('active', v);
+}
+function toggleCtrl() { setCtrlArmed(!ctrlArmed); }
+
+// A-Z (either case) map to their standard control codes; a few punctuation
+// keys have control-code meanings too. Anything else returns null so the
+// caller can fall back to sending the character literally.
+function ctrlByte(ch) {
+  const c = ch.toUpperCase();
+  if (c >= 'A' && c <= 'Z') return String.fromCharCode(c.charCodeAt(0) - 64);
+  return { '[': '\x1b', '\\': '\x1c', ']': '\x1d', '^': '\x1e', '_': '\x1f', '?': '\x7f' }[ch] ?? null;
+}
+
+function keybarTarget() { return focusedPane || panes.values().next().value; }
+
+// A direct key-bar tap always cancels a pending Ctrl arm — Ctrl+Esc/Tab/arrow
+// isn't a meaningful combination here, so there's nothing to apply it to.
+function sendKey(str) {
+  if (ctrlArmed) setCtrlArmed(false);
+  sendRaw(keybarTarget(), str);
+}
+function sendEsc() { sendKey('\x1b'); }
+function sendTab() { sendKey('\t'); }
+function sendCtrlC() { sendKey('\x03'); }
+function sendArrowUp() { sendKey('\x1b[A'); }
+function sendArrowDown() { sendKey('\x1b[B'); }
+function sendArrowLeft() { sendKey('\x1b[D'); }
+function sendArrowRight() { sendKey('\x1b[C'); }
+
 class Pane {
   constructor(id) {
     this.id = id;
@@ -686,12 +783,14 @@ class Pane {
 
     // Input handlers registered once — this.ws always points at the live socket
     this.terminal.onData((data) => {
-      if (!this.ws || this.ws.readyState !== 1) return;
-      const encoded = new TextEncoder().encode(data);
-      const msg = new Uint8Array(1 + encoded.length);
-      msg[0] = 0x30;
-      msg.set(encoded, 1);
-      this.ws.send(msg);
+      if (ctrlArmed) {
+        setCtrlArmed(false);
+        const mapped = data.length === 1 ? ctrlByte(data) : null;
+        if (mapped) { sendRaw(this, mapped); return; }
+        // Not a mappable single character (e.g. a pasted string, or an
+        // arrow-key escape sequence) — fall through and send it literally.
+      }
+      sendRaw(this, data);
     });
     this.terminal.onResize(() => this.sendResize());
   }
