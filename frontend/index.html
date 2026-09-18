@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -30,6 +30,8 @@
       height: 100dvh;
       background: #0d1117;
       padding: 24px;
+      padding-top: max(24px, env(safe-area-inset-top, 0px));
+      padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
     }
     #login-screen h1 {
       font-size: 28px;
@@ -90,10 +92,11 @@
       align-items: center;
       justify-content: space-between;
       padding: 8px 16px;
+      padding-top: max(8px, env(safe-area-inset-top, 0px));
       background: #16213e;
       border-bottom: 1px solid #0f3460;
       flex-shrink: 0;
-      min-height: 44px;
+      min-height: 48px;
       gap: 10px;
     }
     #header h1 {
@@ -130,6 +133,9 @@
       gap: 10px;
     }
     .hdr-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       background: #0f3460;
       color: #a8b2d8;
       border: none;
@@ -137,6 +143,8 @@
       font-size: 16px;
       line-height: 1;
       padding: 5px 12px;
+      min-height: 36px;
+      min-width: 36px;
       cursor: pointer;
     }
     .hdr-btn:active { background: #1a4a8a; }
@@ -159,6 +167,7 @@
       align-items: center;
       justify-content: space-between;
       padding: 10px 16px;
+      padding-top: max(10px, env(safe-area-inset-top, 0px));
       background: #16213e;
       color: #a8b2d8;
       font-size: 13px;
@@ -321,6 +330,17 @@
     @supports (padding: env(safe-area-inset-bottom)) {
       #app { padding-bottom: env(safe-area-inset-bottom); }
     }
+    /* Narrow screens (iPhone widths): the header was tuned for iPad and
+       doesn't fit an iPhone in one row at full size — tighten it up and
+       drop secondary label text, keeping every action reachable by icon. */
+    @media (max-width: 480px) {
+      #header { padding-left: 10px; padding-right: 10px; gap: 6px; }
+      #header-actions { gap: 6px; }
+      .hdr-btn { padding: 5px 9px; font-size: 15px; }
+      #split-btn .btn-label { display: none; }
+      #status { font-size: 11px; padding: 3px 8px; }
+      #build-tag { display: none; }
+    }
   </style>
 </head>
 <body>
@@ -343,7 +363,7 @@
     <div id="header-actions">
       <button class="hdr-btn" id="copy-btn" onclick="openCopyOverlay()" title="Select — view terminal text for copying">⧉</button>
       <button class="hdr-btn" id="paste-btn" onclick="pasteClipboard()" title="Paste clipboard into the terminal">⌘V</button>
-      <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞ Split</button>
+      <button class="hdr-btn" id="split-btn" onclick="addPane()" title="Split — open another terminal">⊞<span class="btn-label"> Split</span></button>
       <button class="hdr-btn" id="layout-btn" onclick="toggleLayout()" title="Toggle stacked / side-by-side panes">⬓</button>
       <button class="hdr-btn" id="terminate-btn" onclick="terminateVm()" title="Terminate this VM (files persist; a fresh VM starts on reload)">⏻</button>
       <span id="status">Connecting…</span>
