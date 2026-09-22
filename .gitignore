@@ -9,3 +9,5 @@ node_modules/
 # Local SAM CLI config — never commit (your AWS profile, personalized
 # parameter_overrides, etc.). See samconfig.toml.example for the template.
 samconfig.toml
+# Local Kiro IDE settings — machine-specific, never commit
+.kiro/
