@@ -1,16 +1,16 @@
 // Shared: resolve a user's per-user MicroVM (id + endpoint) from their email.
 //
 // The token Lambda keys everything on the Cognito `sub`:
-//   /ipad-claude/users/<sub>/mvm-identifier
-//   /ipad-claude/users/<sub>/mvm-endpoint
+//   /remote-developer/users/<sub>/mvm-identifier
+//   /remote-developer/users/<sub>/mvm-endpoint
 // so the break-glass tools need to know WHICH user's VM to target. Pass the
-// user's email via --user <email> (or the IPAD_CLAUDE_USER env var); we look up
-// their sub in the Cognito pool, then read the namespaced SSM params.
+// user's email via --user <email> (or the REMOTE_DEVELOPER_USER env var); we
+// look up their sub in the Cognito pool, then read the namespaced SSM params.
 const { spawnSync } = require('child_process');
 
 const PROFILE = process.env.AWS_PROFILE || 'default';
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const STACK = process.env.STACK_NAME || 'ipad-claude';
+const STACK = process.env.STACK_NAME || 'remote-developer';
 
 function aws(...parts) {
   const r = spawnSync('aws', [...parts, '--profile', PROFILE, '--region', REGION, '--output', 'text'], { encoding: 'utf8' });
@@ -18,11 +18,11 @@ function aws(...parts) {
   return r.stdout.trim();
 }
 
-// Pull --user <email> from argv (or IPAD_CLAUDE_USER). Returns the email or null.
+// Pull --user <email> from argv (or REMOTE_DEVELOPER_USER). Returns the email or null.
 function userArg(argv) {
   const i = argv.indexOf('--user');
   if (i !== -1 && argv[i + 1]) return argv[i + 1];
-  return process.env.IPAD_CLAUDE_USER || null;
+  return process.env.REMOTE_DEVELOPER_USER || null;
 }
 
 function stackOutput(key) {
@@ -36,7 +36,7 @@ function resolveMvm(email) {
   if (!email) {
     throw new Error(
       'No user specified. Per-user MicroVMs are keyed by Cognito user.\n'
-      + '  Pass --user <email>, or set IPAD_CLAUDE_USER=<email>.\n'
+      + '  Pass --user <email>, or set REMOTE_DEVELOPER_USER=<email>.\n'
       + '  (The user must have logged in at least once so their VM exists.)');
   }
   const poolId = stackOutput('UserPoolId');
@@ -48,8 +48,8 @@ function resolveMvm(email) {
 
   let mvmId, endpoint;
   try {
-    mvmId = aws('ssm', 'get-parameter', '--name', `/ipad-claude/users/${sub}/mvm-identifier`, '--query', 'Parameter.Value');
-    endpoint = aws('ssm', 'get-parameter', '--name', `/ipad-claude/users/${sub}/mvm-endpoint`, '--query', 'Parameter.Value');
+    mvmId = aws('ssm', 'get-parameter', '--name', `/remote-developer/users/${sub}/mvm-identifier`, '--query', 'Parameter.Value');
+    endpoint = aws('ssm', 'get-parameter', '--name', `/remote-developer/users/${sub}/mvm-endpoint`, '--query', 'Parameter.Value');
   } catch (e) {
     throw new Error(`No MicroVM for '${email}' yet — they must sign in once to provision it.`);
   }

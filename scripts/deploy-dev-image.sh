@@ -1,17 +1,23 @@
 #!/bin/bash
-# Build a DEV MicroVM image (ipad-claude-dev) from the working tree's microvm/.
-# The production image (the MicrovmImage CFN resource in template.yaml) and
-# per-user VMs are untouched — this is a separate, CLI-managed image purely
-# for rapid local iteration. No project config file: profile/region come
-# from your standard AWS CLI environment, same as deploy.sh.
+# Build a DEV MicroVM image (remote-developer-dev) from the working tree's
+# microvm/. The production image (built by scripts/build-microvm-image.sh)
+# and per-user VMs are untouched — this is a separate image purely for rapid
+# local iteration. No project config file: profile/region come from your
+# standard AWS CLI environment, same as deploy.sh.
+#
+# Configuration here is kept identical to the production image (memory
+# tier, egress connector, base image version) except for the name and the
+# web-search gateway URL, which this script leaves out — set
+# WEBSEARCH_GATEWAY_URL yourself if you need to test that locally too.
+#
 # Usage: ./scripts/deploy-dev-image.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
-STACK_NAME="ipad-claude"
-DEV_IMAGE_NAME="ipad-claude-dev"
-ZIP_KEY="ipad-claude-microvm-dev.zip"
+STACK_NAME="remote-developer"
+DEV_IMAGE_NAME="remote-developer-dev"
+ZIP_KEY="remote-developer-microvm-dev.zip"
 
 out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
@@ -21,15 +27,19 @@ S3_FILES_FS_ID=$(out S3FilesFileSystemId)
 REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
 
 echo "Packaging microvm/ → s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-BUILD_DIR="/tmp/ipad-claude-microvm-dev-build"
+BUILD_DIR="/tmp/remote-developer-microvm-dev-build"
 rm -rf "$BUILD_DIR"; cp -R "$ROOT_DIR/microvm" "$BUILD_DIR"
 sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
+sed -i.bak "s|^ENV DEPLOY_REGION=.*|ENV DEPLOY_REGION=${REGION}|" "$BUILD_DIR/Dockerfile"
+sed -i.bak "s|^ENV WEBSEARCH_REGION=.*|ENV WEBSEARCH_REGION=${WEBSEARCH_REGION:-us-east-1}|" "$BUILD_DIR/Dockerfile"
 rm -f "$BUILD_DIR/Dockerfile.bak"
 rm -f "/tmp/$ZIP_KEY"
 (cd "$BUILD_DIR" && zip -r "/tmp/$ZIP_KEY" . -x "*.DS_Store" > /dev/null)
 aws s3 cp "/tmp/$ZIP_KEY" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
 
 HOOKS_JSON='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180,"validate":"ENABLED","validateTimeoutInSeconds":300},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
+RESOURCES_JSON='[{"minimumMemoryInMiB":4096}]'
+ENV_VARS_JSON=$(python3 -c "import json,sys; print(json.dumps({'S3_FILES_FS_ID': sys.argv[1], 'WEBSEARCH_GATEWAY_URL': sys.argv[2]}))" "$S3_FILES_FS_ID" "${WEBSEARCH_GATEWAY_URL:-}")
 
 IMAGE_ID=$(aws lambda-microvms list-microvm-images \
   --query "items[?name=='$DEV_IMAGE_NAME'].imageArn | [0]" --output text 2>/dev/null || echo "")
@@ -39,22 +49,28 @@ if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "None" ]; then
   IMAGE_ID=$(aws lambda-microvms create-microvm-image \
     --name "$DEV_IMAGE_NAME" \
     --base-image-arn "arn:aws:lambda:${REGION}:aws:microvm-image:al2023-1" \
+    --base-image-version "1" \
     --build-role-arn "$BUILD_ROLE" \
     --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
     --additional-os-capabilities '["ALL"]' \
+    --resources "$RESOURCES_JSON" \
+    --egress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"]" \
     --hooks "$HOOKS_JSON" \
-    --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+    --environment-variables "$ENV_VARS_JSON" \
     --query imageArn --output text)
 else
   echo "Updating dev image $IMAGE_ID..."
   aws lambda-microvms update-microvm-image \
     --image-identifier "$IMAGE_ID" \
     --base-image-arn "arn:aws:lambda:${REGION}:aws:microvm-image:al2023-1" \
+    --base-image-version "1" \
     --build-role-arn "$BUILD_ROLE" \
     --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
     --additional-os-capabilities '["ALL"]' \
+    --resources "$RESOURCES_JSON" \
+    --egress-network-connectors "[\"arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"]" \
     --hooks "$HOOKS_JSON" \
-    --environment-variables "{\"S3_FILES_FS_ID\":\"$S3_FILES_FS_ID\"}" \
+    --environment-variables "$ENV_VARS_JSON" \
     --output json > /dev/null
 fi
 
@@ -65,7 +81,9 @@ for i in $(seq 1 120); do
   STATE=$(echo "$J" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','UNKNOWN'))")
   VER=$(echo "$J" | python3 -c "import sys,json; print(json.load(sys.stdin).get('latestActiveImageVersion',''))")
   if { [ "$STATE" = "UPDATED" ] || [ "$STATE" = "CREATED" ]; } && [ -n "$VER" ]; then
-    echo "Dev image ready: $IMAGE_ID (version $VER)"; exit 0
+    echo "Dev image ready: $IMAGE_ID (version $VER)"
+    aws ssm put-parameter --name /remote-developer/dev-image-arn --type String --overwrite --value "$IMAGE_ID" > /dev/null 2>&1 || true
+    exit 0
   elif [[ "$STATE" == *"FAIL"* ]]; then
     echo "Dev image build FAILED: $STATE" >&2; echo "$J" >&2; exit 1
   fi

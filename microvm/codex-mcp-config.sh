@@ -25,9 +25,14 @@ add_server() {
     "$server_name" -- "$@" >/dev/null
 }
 
+# Signing region must match where the AgentCore Gateway was actually
+# created — WEBSEARCH_REGION, not DEPLOY_REGION (where the rest of the
+# stack lives) or the fixed us-east-1 AWS_REGION this image pins for
+# Bedrock/Claude Code model access. See the Dockerfile's comment on
+# WEBSEARCH_REGION for why these are three separate concerns.
 add_server workspace-web-search \
   uvx mcp-proxy-for-aws@1.6.3 "$gateway_url" \
-  --service bedrock-agentcore --region us-east-1
+  --service bedrock-agentcore --region "${WEBSEARCH_REGION:-us-east-1}"
 
 # The AWS CLI Agent Toolkit creates aws-mcp after the initial mount setup. Its
 # refresh invokes this script with the third argument so this re-adds only that

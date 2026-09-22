@@ -1,7 +1,7 @@
 version = 0.1
 
 [default.global.parameters]
-stack_name = "ipad-claude"
+stack_name = "remote-developer"
 
 [default.build.parameters]
 cached = true

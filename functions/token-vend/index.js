@@ -74,7 +74,7 @@ const s3filesHost = () => `s3files.${region()}.api.aws`;
 // Idempotent: the access-point id is cached in SSM per user after first login.
 async function ensureUserAccessPoint(sub) {
   const fsId = process.env.S3_FILES_FS_ID;
-  const cacheParam = `/ipad-claude/users/${sub}/access-point-id`;
+  const cacheParam = `/remote-developer/users/${sub}/access-point-id`;
 
   try {
     const cached = await getParam(cacheParam);
@@ -114,8 +114,25 @@ async function terminateMvm(mvmId) {
   await sigv4Request('DELETE', mvmHost(), `/2025-09-09/microvms/${encodeURIComponent(mvmId)}`, undefined);
 }
 
+// The image is built by a separate CLI step (scripts/build-microvm-image.sh)
+// that runs AFTER this stack exists, so its ARN isn't known at Lambda deploy
+// time — it's read from SSM fresh on every invocation instead of baked in as
+// an env var. This also means rebuilding the image never requires
+// redeploying this Lambda.
+async function getImageArn() {
+  const paramName = process.env.IMAGE_ARN_PARAM;
+  try {
+    return await getParam(paramName);
+  } catch (e) {
+    throw new Error(
+      `No MicroVM image ARN found at SSM parameter ${paramName}. ` +
+      `Run scripts/build-microvm-image.sh first — see the README's Stage 3.`
+    );
+  }
+}
+
 async function runNewMvm(accessPointId) {
-  const imageArn = process.env.IMAGE_ARN;
+  const imageArn = await getImageArn();
   const executionRoleArn = process.env.EXECUTION_ROLE_ARN;
   const networkConnectorArn = process.env.NETWORK_CONNECTOR_ARN;
 
@@ -186,8 +203,8 @@ exports.handler = async (event) => {
   }
 
   // Per-user SSM keys — each user has their own MicroVM + home.
-  const mvmIdParam = `/ipad-claude/users/${sub}/mvm-identifier`;
-  const mvmEndpointParam = `/ipad-claude/users/${sub}/mvm-endpoint`;
+  const mvmIdParam = `/remote-developer/users/${sub}/mvm-identifier`;
+  const mvmEndpointParam = `/remote-developer/users/${sub}/mvm-endpoint`;
 
   // ── DELETE /token: terminate THIS user's VM ───────────────────────────────
   // The VM id comes from the caller's own SSM parameter (keyed by their

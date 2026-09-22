@@ -17,8 +17,11 @@ const MVM_EP_FILE = '/tmp/microvm-endpoint';
 // The public endpoint isn't derivable from the VM id and may not be in the
 // /run envelope — ask the control plane about ourselves (execution role has
 // PowerUserAccess, so get-microvm is allowed). Background + best-effort.
+// DEPLOY_REGION (not AWS_REGION, which this image pins to us-east-1 for
+// Bedrock) — this MicroVM itself only exists in the region the stack
+// deployed to, so that's the region get-microvm must query.
 function lookupEndpoint(mvmId) {
-  const region = process.env.AWS_REGION || 'us-east-1';
+  const region = process.env.DEPLOY_REGION || 'us-east-1';
   const child = spawn('/bin/sh', ['-c',
     `EP=$(aws lambda-microvms get-microvm --microvm-identifier "${mvmId}" ` +
     `--region "${region}" --query endpoint --output text 2>/dev/null); ` +

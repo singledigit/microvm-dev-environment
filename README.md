@@ -78,15 +78,12 @@ flowchart TD
 - **SAM template** (`template.yaml`) — VPC + security group, the S3 buckets
   (frontend / artifacts / workspace), the S3 Files filesystem + mount targets,
   the Cognito pool + authorizer, IAM roles, the token Lambda + API Gateway,
-  CloudFront, a Lambda Network Connector for VPC egress to the S3 Files
-  mount targets, and the MicroVM image itself as a first-class
-  `AWS::Serverless::MicrovmImage` resource (name, memory tier, OS
-  capabilities, and lifecycle hooks are all literals on that one resource —
-  see its comment in `template.yaml`). One `sam deploy` provisions all of it,
-  including building/updating the MicroVM image; only the AgentCore
-  web-search gateway is created out-of-band by `deploy.sh` (a CFN resource
-  handler bug with the connector's target config — see that resource's
-  comment).
+  CloudFront, and a Lambda Network Connector for VPC egress to the S3 Files
+  mount targets. One `sam deploy` provisions all of it. The MicroVM image
+  itself is **not** part of this template — it's built with plain `aws
+  lambda-microvms` CLI commands, run as separate, visible steps after the
+  SAM stack exists. See [Deploying](#deploying) for why, and for the full
+  walkthrough.
 
 **Per-user isolation:** each Cognito user gets their own MicroVM and their own
 home directory (an S3 Files access point scoped to their `sub`). Adding a user
@@ -157,9 +154,16 @@ operations.
 - **Kiro CLI needs its own account**, unrelated to this AWS account or
   Bedrock — it's a hosted service. Each user signs in themselves on first use;
   see [Signing in to Kiro CLI](#signing-in-to-kiro-cli) below.
-- **AWS Lambda MicroVMs** available in your region (this project uses
-  `us-east-1`). MicroVMs are a newer capability — make sure your account/region
-  has access.
+- **AWS Lambda MicroVMs** available in your region (this project defaults to
+  `us-east-1`, but the stack itself can deploy to any region where MicroVMs
+  are available — set `region` in `samconfig.toml`). MicroVMs are a newer
+  capability — make sure your account/region has access. Note this is
+  independent of the Bedrock region requirement above: Claude Code inside the
+  VM always calls Bedrock in `us-east-1`/`us-west-2` regardless of which
+  region you deploy the stack itself to.
+- **AgentCore web-search connector activation** — separate again from both
+  of the above, and only enabled per-account in specific regions today
+  (`us-east-1` works) — see [Step 2](#step-2--create-the-agentcore-web-search-gateway).
 - Local tooling: **AWS CLI v2**, the **AWS SAM CLI**, and **Node.js 20+**. Docker
   is *not* required — the MicroVM image is built server-side by the build service.
   Inside the workspace, `kiro-cli login` performs its one-time device-flow login;
@@ -173,16 +177,21 @@ anything by hand — `sam deploy` makes it all.
 
 ## Deploying
 
-**The one command that does everything is `./scripts/deploy.sh`** (see
-[Just run the script](#just-run-the-script) below). If you only want a working
-deployment, skip there.
+Deploying is a sequence of **separate, visible steps** — each one a real AWS
+CLI (or `sam`) command shown below, run yourself, in order. This is a
+teaching repo: the point is that you can read every command that touches
+your account before you run it, not paste one script and trust it. Skip to
+[Do it all for me](#do-it-all-for-me) at the end of this section once you've
+seen what each step actually does — that's the same sequence wrapped in
+scripts, offered purely as a convenience, not as the documentation.
 
-The rest of this section walks the four layers by hand — infra, frontend, image,
-user — so you can see what the script automates. The snippets build on each
-other: run them in **one shell session**, top to bottom, after the Configure
-step. They're a teaching aid, not a substitute for the script.
+The steps below assume **one continuous shell session** — each step's
+commands set shell variables (`$STACK_NAME`, `$IMAGE_ARN`, etc.) that later
+steps read. If you come back later and only want to re-run one step, re-set
+its variables first; each step below says which ones it needs and how to
+re-derive them from the stack/image/gateway directly.
 
-### Configure
+Set your account/region up first:
 
 ```bash
 cp samconfig.toml.example samconfig.toml
@@ -192,114 +201,256 @@ $EDITOR samconfig.toml    # set region, and profile if you don't use your defaul
 `samconfig.toml` is how `sam build`/`sam deploy` know the stack name, region,
 profile, and capabilities — nothing in this repo reads it except `sam` itself.
 It's git-ignored (see `samconfig.toml.example` for the committed template), so
-your profile name never gets committed.
+your profile name never gets committed. The commands below that use plain
+`aws` (not `sam`) don't read `samconfig.toml` — they use the AWS CLI's normal
+resolution (`AWS_PROFILE`/`AWS_REGION` env vars, or your default profile), so
+export those first if you're not using your default:
+
+```bash
+export AWS_PROFILE=your-profile AWS_REGION=us-east-1
+```
 
 Optionally personalize the `admin-create-user` email that shows up in the
 stack's Outputs (cosmetic only — it's not a credential) by uncommenting
-`parameter_overrides` in `samconfig.toml`, e.g.:
+`parameter_overrides` in `samconfig.toml`:
 
 ```toml
 parameter_overrides = "LoginEmail=\"you@example.com\""
 ```
 
-Skip this and it defaults to `you@example.com` — you can always override it
-per-command with `sam deploy --parameter-overrides LoginEmail=...`, or just
-edit the created user's email later. Whatever value CloudFormation last saw
-for `LoginEmail` is retained on every future deploy, since `deploy.sh` never
-passes it itself.
+Skip this and it defaults to `you@example.com` — override it per-command
+instead with `sam deploy --parameter-overrides LoginEmail=...`, or edit the
+created user's email later.
 
-Helper used by every stage below — pulls one stack output by key (relies on
-`sam`'s AWS CLI env resolution, same as everything else here):
+### Step 1 — Deploy the infrastructure with SAM
 
-```bash
-out() { aws cloudformation describe-stacks --stack-name ipad-claude \
-  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-```
-
-### Stage 1 — Infrastructure (SAM)
-
-The whole stack is one AWS SAM template (`template.yaml`): the VPC + NAT +
-subnets + NFS security group, the three S3 buckets, the **S3 Files filesystem +
-mount targets**, the Cognito user pool + client, the token-vending Lambda +
-API Gateway (with the Cognito authorizer), CloudFront, the VPC-egress network
-connector, and the MicroVM image itself.
+The whole stack except the MicroVM image is one AWS SAM template
+(`template.yaml`): the VPC + NAT + subnets + NFS security group, the three
+S3 buckets, the **S3 Files filesystem + mount targets**, the Cognito user
+pool + client, the token-vending Lambda + API Gateway (with the Cognito
+authorizer), CloudFront, and the VPC-egress network connector.
 
 ```bash
 sam build
 sam deploy
 ```
 
-No flags needed — `samconfig.toml` supplies the stack name, region, profile,
-and capabilities. The very first deploy won't yet have a real
-`MicrovmCodeUri` to pass, so it fails fast on that required parameter; that's
-expected — see [Just run the script](#just-run-the-script) below for the
-one-time bootstrap order. Inspect all outputs any time with:
+No flags needed on a brand-new account — `samconfig.toml` supplies the stack
+name, region, profile, and capabilities, and the template's only Parameter
+(`LoginEmail`) has a default.
+
+`sam deploy` prints every stack Output when it finishes, including
+`TokenApiUrl`, `FrontendUrl`, `UserPoolId`, `LoginEmail`, and
+`CreateUserCommand` (Step 6 uses that last one). Inspect them again any time:
 
 ```bash
-aws cloudformation describe-stacks --stack-name ipad-claude \
+aws cloudformation describe-stacks --stack-name remote-developer \
   --query "Stacks[0].Outputs" --output table
 ```
 
-### Stage 2 — Frontend (S3 + CloudFront)
-
-The frontend is one static `index.html` with a placeholder line
-`window.APP_CONFIG = {}; /* APP_CONFIG_PLACEHOLDER */`. Replace it with the real
-config — token API URL, region, and Cognito pool/client ids from Stage 1's
-outputs — then upload and invalidate the CDN.
+The commands below read several of these outputs directly. Save them to
+shell variables now:
 
 ```bash
-REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
-CONFIG=$(cat <<JSON
-{"tokenApiUrl":"$(out TokenApiUrl)","region":"$REGION","userPoolId":"$(out UserPoolId)","userPoolClientId":"$(out UserPoolClientId)"}
-JSON
-)
-
-# Replace the whole placeholder line with the injected config.
-sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $CONFIG;</script>|" \
-  frontend/index.html > /tmp/index.html
-
-aws s3 cp /tmp/index.html "s3://$(out FrontendBucketName)/index.html"
-aws cloudfront create-invalidation --distribution-id "$(out CloudFrontDistributionId)" --paths "/*"
+STACK_NAME=remote-developer
+ARTIFACT_BUCKET=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" --output text)
+BUILD_ROLE=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='BuildRoleArn'].OutputValue" --output text)
+S3_FILES_FS_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='S3FilesFileSystemId'].OutputValue" --output text)
+WEBSEARCH_GW_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='WebSearchGatewayRoleArn'].OutputValue" --output text)
+FRONTEND_BUCKET=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" --output text)
+CF_DIST_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)
+USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+USER_POOL_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+TOKEN_API_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='TokenApiUrl'].OutputValue" --output text)
 ```
 
-### Stage 3 — MicroVM image
-
-The image is a real CFN resource (`AWS::Serverless::MicrovmImage` — see
-`MicrovmImage` in `template.yaml`), not a hand-rolled CLI dance. Its
-configuration — name (`remote-dev`), memory tier (4096 MiB baseline), OS
-capabilities, base image, and lifecycle hooks — are all literals on that one
-resource. All you provide from outside is `CodeUri`: an S3 URI to the zipped
-`microvm/` source, passed as the `MicrovmCodeUri` parameter.
+`sam deploy` provisions the frontend's bucket and CloudFront distribution,
+but doesn't upload anything into that bucket — `frontend/index.html` ships
+with a placeholder for its runtime config (token API URL, region, Cognito
+ids), so it needs rendering before it's actually useful:
 
 ```bash
-ARTIFACT_BUCKET=$(out ArtifactBucketName)
-S3_FILES_FS_ID=$(out S3FilesFileSystemId)   # the stack created this in Stage 1
+RENDERED=/tmp/remote-developer-index.html
+APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$AWS_REGION\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\"}"
+sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
+  frontend/index.html > "$RENDERED"
 
-# Render the FS id into a build copy (never commit an account-specific value).
-BUILD_DIR=/tmp/rdev-microvm-build
-rm -rf "$BUILD_DIR"; cp -R microvm "$BUILD_DIR"
+aws s3 cp "$RENDERED" "s3://$FRONTEND_BUCKET/index.html" \
+  --cache-control "no-cache, no-store, must-revalidate" --content-type "text/html"
+aws cloudfront create-invalidation --distribution-id "$CF_DIST_ID" --paths "/*"
+rm -f "$RENDERED"
+```
+
+Without this, `FrontendUrl` returns a `403` (empty bucket) even though the
+stack itself deployed successfully. Re-run it any time `frontend/index.html`
+changes, or after a stack update that changed any of the values above.
+
+### Step 2 — Create the AgentCore web-search gateway
+
+Each in-VM CLI reaches web search over MCP through an AgentCore Gateway with
+a managed `web-search` connector target.
+
+> The web-search **connector** is only activated per-account in specific
+> regions today — `us-east-1` works; if you get `"Connector integration
+> web-search is not available for this account"` in your stack's own
+> region, create the gateway in `us-east-1` instead (as below) — it's
+> independent of where the rest of the stack deployed in Step 1, since IAM
+> roles are global.
+
+```bash
+WEBSEARCH_REGION=us-east-1
+GATEWAY_NAME="${STACK_NAME//-/}websearch"
+
+GATEWAY_ID=$(aws bedrock-agentcore-control create-gateway --region $WEBSEARCH_REGION \
+  --name "$GATEWAY_NAME" \
+  --protocol-type MCP \
+  --authorizer-type AWS_IAM \
+  --role-arn "$WEBSEARCH_GW_ROLE_ARN" \
+  --query gatewayId --output text)
+
+# Wait until it reports READY before adding a target.
+aws bedrock-agentcore-control get-gateway --region $WEBSEARCH_REGION \
+  --gateway-identifier "$GATEWAY_ID" --query status --output text
+
+aws bedrock-agentcore-control create-gateway-target --region $WEBSEARCH_REGION \
+  --gateway-identifier "$GATEWAY_ID" \
+  --name "websearch" \
+  --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
+  --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]'
+
+# Wait until the target reports READY too, then grab the MCP endpoint URL —
+# the image needs this to reach the gateway.
+aws bedrock-agentcore-control list-gateway-targets --region $WEBSEARCH_REGION \
+  --gateway-identifier "$GATEWAY_ID" --query "items[0].status" --output text
+
+WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --region $WEBSEARCH_REGION \
+  --gateway-identifier "$GATEWAY_ID" --query gatewayUrl --output text)
+```
+
+Re-run this step only if you ever delete the gateway — `list-gateways
+--query "items[?name=='$GATEWAY_NAME']"` tells you if it already exists.
+
+### Step 3 — Package and upload the MicroVM source
+
+The image is built server-side from a zip of `microvm/` plus its
+`Dockerfile`. Three values get substituted into a *copy* of the Dockerfile
+first — this account's S3 Files filesystem id, the stack's actual deploy
+region, and the web-search gateway's region — never into the committed one:
+
+```bash
+DEPLOY_REGION="$AWS_REGION"   # the region you deployed the stack to in Step 1 — NOT
+                               # `aws configure get region`, which reads your profile's
+                               # own default and can silently differ from where you
+                               # actually pointed sam deploy via samconfig.toml
+IMAGE_NAME=remote-dev
+
+BUILD_DIR=/tmp/remote-developer-microvm-build
+rm -rf "$BUILD_DIR" && cp -R microvm "$BUILD_DIR"
 sed -i.bak "s|^ENV S3_FILES_FS_ID=.*|ENV S3_FILES_FS_ID=${S3_FILES_FS_ID}|" "$BUILD_DIR/Dockerfile"
+sed -i.bak "s|^ENV DEPLOY_REGION=.*|ENV DEPLOY_REGION=${DEPLOY_REGION}|" "$BUILD_DIR/Dockerfile"
+sed -i.bak "s|^ENV WEBSEARCH_REGION=.*|ENV WEBSEARCH_REGION=${WEBSEARCH_REGION}|" "$BUILD_DIR/Dockerfile"
 rm -f "$BUILD_DIR/Dockerfile.bak"
 
-# Content-hash the zip into its S3 key: CloudFormation only diffs property
-# VALUES, and MicrovmImage's CodeUri isn't in SAM's auto-upload list (unlike
-# a Function's CodeUri), so a fixed key would silently never trigger a
-# rebuild on a real change.
-ZIP_PATH=/tmp/rdev-microvm.zip
-rm -f "$ZIP_PATH"; (cd "$BUILD_DIR" && zip -r "$ZIP_PATH" . -x "*.DS_Store")
-ZIP_HASH=$(shasum -a 256 "$ZIP_PATH" | cut -c1-16)
-ZIP_KEY="microvm/remote-dev-microvm-${ZIP_HASH}.zip"
-aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
-
-sam deploy --parameter-overrides "MicrovmCodeUri=s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+ZIP_KEY="microvm/${IMAGE_NAME}.zip"
+(cd "$BUILD_DIR" && zip -r "/tmp/${IMAGE_NAME}.zip" . -x "*.DS_Store")
+aws s3 cp "/tmp/${IMAGE_NAME}.zip" "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
 ```
 
-`sam deploy` waits on CloudFormation's own stabilization for the image build
-(~5-10 min on a real change to `microvm/`) — no manual polling needed. If
-`microvm/` hasn't changed, the hash produces the same key and CodeUri comes
-out identical, so CloudFormation no-ops the resource. Changing
-`AdditionalOsCapabilities` is now an ordinary in-place update too (the old
-CLI-based flow required deleting and recreating the image for that).
+`DEPLOY_REGION` is where the stack lives; `WEBSEARCH_REGION` is where the
+gateway lives (from Step 2) — pass both even when they're the same value.
+
+### Step 4 — Create (or update) the MicroVM image
+
+```bash
+HOOKS_JSON='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":180,"validate":"ENABLED","validateTimeoutInSeconds":300},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":10,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
+RESOURCES_JSON='[{"minimumMemoryInMiB":4096}]'
+ENV_VARS_JSON=$(printf '{"S3_FILES_FS_ID":"%s","WEBSEARCH_GATEWAY_URL":"%s"}' "$S3_FILES_FS_ID" "$WEBSEARCH_GATEWAY_URL")
+```
+
+**First build** — no image with this name exists yet:
+
+```bash
+IMAGE_ARN=$(aws lambda-microvms create-microvm-image \
+  --name "$IMAGE_NAME" \
+  --base-image-arn "arn:aws:lambda:${DEPLOY_REGION}:aws:microvm-image:al2023-1" \
+  --base-image-version "1" \
+  --build-role-arn "$BUILD_ROLE" \
+  --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
+  --additional-os-capabilities '["ALL"]' \
+  --resources "$RESOURCES_JSON" \
+  --egress-network-connectors "[\"arn:aws:lambda:${DEPLOY_REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"]" \
+  --hooks "$HOOKS_JSON" \
+  --environment-variables "$ENV_VARS_JSON" \
+  --query imageArn --output text)
+```
+
+**Rebuilding an existing image** — find its ARN, then update in place. If
+you're picking this up in a fresh shell (Step 2 wasn't just run), also
+re-derive `$WEBSEARCH_GATEWAY_URL` from the existing gateway before building
+`$ENV_VARS_JSON` above — otherwise it silently goes into the image empty:
+
+```bash
+GATEWAY_NAME="${STACK_NAME//-/}websearch"
+GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways --region "$WEBSEARCH_REGION" \
+  --query "items[?name=='$GATEWAY_NAME'].gatewayId | [0]" --output text)
+WEBSEARCH_GATEWAY_URL=$(aws bedrock-agentcore-control get-gateway --region "$WEBSEARCH_REGION" \
+  --gateway-identifier "$GATEWAY_ID" --query gatewayUrl --output text)
+
+IMAGE_ARN=$(aws lambda-microvms list-microvm-images \
+  --query "items[?name=='$IMAGE_NAME'].imageArn | [0]" --output text)
+
+aws lambda-microvms update-microvm-image \
+  --image-identifier "$IMAGE_ARN" \
+  --base-image-arn "arn:aws:lambda:${DEPLOY_REGION}:aws:microvm-image:al2023-1" \
+  --base-image-version "1" \
+  --build-role-arn "$BUILD_ROLE" \
+  --code-artifact "{\"uri\":\"s3://$ARTIFACT_BUCKET/$ZIP_KEY\"}" \
+  --additional-os-capabilities '["ALL"]' \
+  --resources "$RESOURCES_JSON" \
+  --egress-network-connectors "[\"arn:aws:lambda:${DEPLOY_REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"]" \
+  --hooks "$HOOKS_JSON" \
+  --environment-variables "$ENV_VARS_JSON"
+```
+
+> `update-microvm-image` replaces the entire version config on every call —
+> always pass every property, as above, never a partial flag set.
+
+Memory is a fixed tier, not a free-form value: MicroVMs bill continuously at
+the configured baseline while running, and auto-burst up to 4x under load,
+billed per second only while actually bursting (512→2048 MiB peak,
+1024→4096, 2048→8192, 4096→16384, 8192→32768). `RESOURCES_JSON` above uses
+4096 MiB baseline / 16384 MiB peak — headroom for sustained Claude Code /
+build workloads without paying the 8192 tier's continuous rate for capacity
+mostly needed only in bursts. Edit that literal to move tiers.
+
+Then poll until the build finishes — `state` needs to reach `CREATED` or
+`UPDATED` **and** `latestActiveImageVersion` needs to be non-empty (state
+can flip before the version is populated), which typically takes 5-10
+minutes on a first build:
+
+```bash
+aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
+  --query "{state:state,version:latestActiveImageVersion}"
+```
+
+Once it's ready, publish the image ARN to SSM — this is what the token
+Lambda reads at runtime (see `TokenFunction`'s comment in `template.yaml`).
+It's deliberately **not** a Lambda env var: that would force a redeploy of
+the Lambda every time you rebuild the image.
+
+```bash
+aws ssm put-parameter --name /remote-developer/image-arn --type String \
+  --overwrite --value "$IMAGE_ARN"
+```
 
 **You don't launch a persistent MicroVM here** — the token Lambda does that
 per user, on demand: when a user logs in, it reads their verified Cognito
@@ -308,15 +459,66 @@ access-point id in `--run-hook-payload` (the `/run` hook mounts it). The
 ingress connectors expose HTTP (the terminal) and SHELL (the `tools/` helpers);
 the egress connector reaches the S3 Files mount targets.
 
-### Stage 4 — Create a user
+Re-run Steps 3-4 any time `microvm/` changes.
 
-Auth is Cognito with no self-signup, so you create users yourself. `sam
-deploy` already printed a ready-to-run command for this as the
-`CreateUserCommand` output (built from the `LoginEmail` parameter you set in
-Configure) — just copy it from the deploy output, or fetch it again any time:
+### Step 5 — Smoke test (optional)
+
+Nothing in the app requires this — it exists purely so you can confirm the
+image actually boots and mounts correctly right after building it, instead
+of finding out only when you try to sign in through the browser. It launches
+one throwaway MicroVM (with a temporary S3 Files access point, exercising
+the real per-user mount path), checks that the terminal server responds over
+HTTP, then tears everything down.
+
+Needs `$STACK_NAME`, `$DEPLOY_REGION`, `$S3_FILES_FS_ID`, and `$IMAGE_ARN`
+from Steps 1/3/4 — in a fresh shell, re-set `STACK_NAME=remote-developer`
+and `DEPLOY_REGION` to whatever region the stack actually deployed to (check
+`samconfig.toml`, not `aws configure get region` — see Step 3), and
+re-derive the rest as shown in those steps.
 
 ```bash
-out CreateUserCommand
+EXECUTION_ROLE=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text)
+
+SMOKE_AP=$(aws s3files create-access-point \
+  --file-system-id "$S3_FILES_FS_ID" \
+  --posix-user 'uid=1000,gid=1000' \
+  --root-directory 'path=/users/_smoketest,creationPermissions={ownerUid=1000,ownerGid=1000,permissions=0755}' \
+  --query 'accessPointId' --output text)
+
+MVM_ID=$(aws lambda-microvms run-microvm \
+  --image-identifier "$IMAGE_ARN" \
+  --execution-role-arn "$EXECUTION_ROLE" \
+  --idle-policy '{"maxIdleDurationSeconds":1800,"suspendedDurationSeconds":600,"autoResumeEnabled":true}' \
+  --maximum-duration-in-seconds 28800 \
+  --ingress-network-connectors "[\"arn:aws:lambda:${DEPLOY_REGION}:aws:network-connector:aws-network-connector:HTTP_INGRESS\",\"arn:aws:lambda:${DEPLOY_REGION}:aws:network-connector:aws-network-connector:SHELL_INGRESS\"]" \
+  --run-hook-payload "{\"accessPointId\":\"$SMOKE_AP\"}" \
+  --query microvmId --output text)
+
+# Give snapshot boot + the /run hook mount a moment, then probe ttyd:
+sleep 15
+MVM_ENDPOINT=$(aws lambda-microvms get-microvm --microvm-identifier "$MVM_ID" --query endpoint --output text)
+SMOKE_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
+  --microvm-identifier "$MVM_ID" --expiration-in-minutes 5 \
+  --allowed-ports '[{"port":8080}]' --query 'authToken."X-aws-proxy-auth"' --output text)
+curl -sI -H "X-aws-proxy-auth: $SMOKE_TOKEN" "https://$MVM_ENDPOINT/"
+
+# Tear it down:
+aws lambda-microvms terminate-microvm --microvm-identifier "$MVM_ID"
+aws s3files delete-access-point --access-point-id "$SMOKE_AP"
+```
+
+### Step 6 — Create a user
+
+Auth is Cognito with no self-signup, so you create users yourself. Step 1's
+`sam deploy` already printed a ready-to-run command for this as the
+`CreateUserCommand` output (built from the `LoginEmail` you set earlier) —
+copy it from that output, or fetch it again any time (needs `$STACK_NAME`
+— in a fresh shell, `STACK_NAME=remote-developer`):
+
+```bash
+aws cloudformation describe-stacks --stack-name $STACK_NAME \
+  --query "Stacks[0].Outputs[?OutputKey=='CreateUserCommand'].OutputValue" --output text
 ```
 
 It looks like:
@@ -336,49 +538,87 @@ prompts them to choose a new permanent one (Cognito's standard
 - To skip the first-login prompt entirely and set a ready-to-use password:
   ```bash
   aws cognito-idp admin-set-user-password \
-    --user-pool-id "$(out UserPoolId)" --username you@example.com \
+    --user-pool-id <pool-id> --username you@example.com \
     --password 'YourReal-Password1!' --permanent
   ```
 
 Now open the CloudFront URL, sign in with that email and password, and you're in
 the terminal — with your own MicroVM and persistent home.
 
-### Just run the script
+### Do it all for me
 
-`scripts/deploy.sh` does all of the above end-to-end: ensures the AgentCore
-web-search gateway, packages and uploads the MicroVM source, runs
-`sam build` + `sam deploy` (which creates/updates the stack **and** the
-MicroVM image in one shot), syncs the frontend config, then launches a
-throwaway VM to smoke-test the image and tears it down. `sam deploy` itself
-prints `TokenApiUrl`, `FrontendUrl`, `UserPoolId`, `LoginEmail`, and
-`CreateUserCommand` as part of its own output — deploy.sh doesn't repeat them.
-It does **not** launch a persistent VM — that happens per user at login.
+Once you've read the steps above, `scripts/` has the same sequence wrapped
+into three scripts — a convenience for repeat deploys, not a substitute for
+understanding what they run:
 
 ```bash
-./scripts/deploy.sh
+./scripts/deploy.sh                  # Step 1 (sam build/deploy) + frontend sync
+./scripts/build-microvm-image.sh     # Steps 2-4 (gateway, package, image, SSM)
+./scripts/smoke-test-vm.sh           # Step 5 (optional)
+# Step 6 still has no script — create the user yourself, see above
 ```
 
-| Flag | Effect |
-|---|---|
-| *(none)* | Full deploy: web-search gateway + SAM stack (incl. image) + frontend + smoke test |
-| `--skip-infra` | Reuse the existing stack outputs — frontend sync + smoke test only |
-| `--skip-mvm` | Deploy infra/image but skip the throwaway smoke-test VM |
+`./scripts/build-microvm-image.sh` reads `WEBSEARCH_REGION` from your
+environment if you want to override the default (`WEBSEARCH_REGION=your-region
+./scripts/build-microvm-image.sh`), same as Step 2 above.
 
-**Bootstrapping a brand-new stack:** `deploy.sh` resolves `ArtifactBucketName`
-and `WebSearchGatewayRoleArn` from the stack's *existing* outputs before it
-can compute `MicrovmCodeUri`/`WebSearchGatewayUrl` — so the very first-ever
-deploy needs one bare `sam build && sam deploy` first (Stage 1 above) to
-create the bucket and role, and it's expected to fail on the required
-`MicrovmCodeUri` parameter with nothing to pass yet. Once that first partial
-deploy has created the bucket + role, run `./scripts/deploy.sh` normally and
-it takes over from there. Every deploy after that is just `./scripts/deploy.sh`.
+### Flags
+
+| Script | Flag | Effect |
+|---|---|---|
+| `deploy.sh` | *(none)* | SAM build + deploy, then frontend sync |
+| `deploy.sh` | `--skip-infra` | Reuse the existing stack — frontend sync only |
+
+### Tearing it down
+
+`aws cloudformation delete-stack --stack-name remote-developer` does **not**
+remove everything. `template.yaml` marks `ArtifactBucket`, `WorkspaceBucket`,
+and the Cognito `UserPool` with `DeletionPolicy: Retain` — deliberately, so a
+stack delete can't accidentally wipe out every user's persistent home or
+their Cognito accounts. `FrontendBucket` has no such policy and deletes
+normally.
+
+Full order — the stack can't delete while it still owns the gateway/image
+(neither is a stack resource) or while its buckets are non-empty:
+
+```bash
+# 1. AgentCore gateway (created in WEBSEARCH_REGION, not the stack's own region)
+aws bedrock-agentcore-control delete-gateway-target --region "$WEBSEARCH_REGION" \
+  --gateway-identifier "$GATEWAY_ID" --target-id "$TARGET_ID"
+aws bedrock-agentcore-control delete-gateway --region "$WEBSEARCH_REGION" --gateway-identifier "$GATEWAY_ID"
+
+# 2. MicroVM image
+aws lambda-microvms delete-microvm-image --image-identifier "$IMAGE_ARN"
+
+# 3. Empty every bucket sam deploy created — FrontendBucket deletes with the
+#    stack; ArtifactBucket and WorkspaceBucket are versioned (S3 Files
+#    requires versioning), so `aws s3 rm --recursive` only adds a delete
+#    marker and leaves old object versions behind — list and purge every
+#    version explicitly, or `delete-bucket` fails with BucketNotEmpty:
+aws s3api list-object-versions --bucket "$ARTIFACT_BUCKET" --output json \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps({'Objects':[{'Key':o['Key'],'VersionId':o['VersionId']} for o in d.get('Versions',[])+d.get('DeleteMarkers',[])]}))" \
+  > /tmp/versions.json
+aws s3api delete-objects --bucket "$ARTIFACT_BUCKET" --delete file:///tmp/versions.json
+# repeat the two commands above for $WORKSPACE_BUCKET
+
+# 4. SSM parameter, then the stack itself (deletes FrontendBucket for you)
+aws ssm delete-parameter --name /remote-developer/image-arn
+aws cloudformation delete-stack --stack-name "$STACK_NAME"
+
+# 5. The three retained resources — only if you want a FULL account cleanup,
+#    not just a safe redeploy. This permanently deletes every user's
+#    persistent home and Cognito account:
+aws cognito-idp delete-user-pool --user-pool-id "$USER_POOL_ID"
+aws s3api delete-bucket --bucket "$ARTIFACT_BUCKET"
+aws s3api delete-bucket --bucket "$WORKSPACE_BUCKET"
+```
 
 ---
 
 ## Operations
 
-Deploying is the only script you need for normal use — once `deploy.sh`
-finishes, everything runs from the browser. The helpers in `tools/` are
+Deploying is the only thing you need to do for normal use — once Step 6 is
+done, everything runs from the browser. The helpers in `tools/` are
 optional break-glass utilities for reaching *into* a running MicroVM (which has
 no SSH; access is over the service ingress connectors). They read
 `AWS_PROFILE` / `AWS_REGION` from your environment — export them first:
@@ -389,7 +629,7 @@ cd tools && npm install && cd ..   # first time only (installs the `ws` client)
 ```
 
 MicroVMs are per-user, so both tools need to know **which** user's VM to reach —
-pass `--user <email>` (or set `IPAD_CLAUDE_USER`). The user must have logged in
+pass `--user <email>` (or set `REMOTE_DEVELOPER_USER`). The user must have logged in
 at least once so their VM exists.
 
 - **Interactive shell into a user's MicroVM** (SSH-equivalent, over SHELL_INGRESS):
@@ -432,7 +672,7 @@ a few things still warrant care before you point it at anything sensitive:
   must carry it, it caps those roles at the sandbox's own privilege level, and
   it self-propagates to roles *they* create. IAM users/access keys are never
   grantable, the boundary itself can't be edited or detached, and the
-  sandbox's own `ipad-claude-*` roles are off-limits. Anything Claude (or the
+  sandbox's own `remote-developer-*` roles are off-limits. Anything Claude (or the
   user) runs in the terminal wields these credentials (resolved from the
   instance role via IMDS), **and every user's VM shares this one role**.
   Scope `MicroVmExecutionRole` down in `template.yaml` to only the services
@@ -456,19 +696,23 @@ including role creation — with one requirement: **every IAM role created from
 inside the sandbox must carry the permissions boundary**
 
 ```
-arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
+arn:aws:iam::<account-id>:policy/remote-developer-sandbox-boundary-<region>
 ```
 
-(get the account id from `aws sts get-caller-identity`). A `CreateRole`
-without it is denied — if a deploy fails with `AccessDenied` on
-`iam:CreateRole`, a missing boundary is almost always why. How to attach it:
+(get the account id from `aws sts get-caller-identity`, and `<region>` from
+`aws configure get region` or `$AWS_REGION` — the suffix is required, not
+decoration: IAM policy names are a global, account-wide namespace, so a
+second deploy of this stack in a different region needs a differently-named
+boundary or it collides with the first one). A `CreateRole` without it is
+denied — if a deploy fails with `AccessDenied` on `iam:CreateRole`, a missing
+boundary is almost always why. How to attach it:
 
 - **SAM** — all function roles at once, in `template.yaml`:
 
   ```yaml
   Globals:
     Function:
-      PermissionsBoundary: arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary
+      PermissionsBoundary: arn:aws:iam::<account-id>:policy/remote-developer-sandbox-boundary-<region>
   ```
 
   or per-role via the `PermissionsBoundary` property on `AWS::IAM::Role`.
@@ -478,17 +722,17 @@ without it is denied — if a deploy fails with `AccessDenied` on
   ```json
   // cdk.json
   { "context": { "@aws-cdk/core:permissionsBoundary": {
-      "name": "ipad-claude-sandbox-boundary" } } }
+      "name": "remote-developer-sandbox-boundary-<region>" } } }
   ```
 
   or per-role: `new iam.Role(..., { permissionsBoundary:
-  iam.ManagedPolicy.fromManagedPolicyName(this, 'Pb', 'ipad-claude-sandbox-boundary') })`.
+  iam.ManagedPolicy.fromManagedPolicyName(this, 'Pb', 'remote-developer-sandbox-boundary-<region>') })`.
 
 - **CLI** —
 
   ```bash
   aws iam create-role --role-name my-role \
-    --permissions-boundary arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary \
+    --permissions-boundary arn:aws:iam::<account-id>:policy/remote-developer-sandbox-boundary-<region> \
     --assume-role-policy-document file://trust.json
   ```
 
@@ -503,9 +747,10 @@ automatically.
 ## Repo layout
 
 ```
-template.yaml         the SAM template — all AWS infrastructure, including
-                       the MicrovmImage resource (name/memory/capabilities/
-                       hooks all literal on that one resource)
+template.yaml         the SAM template — VPC, S3, S3 Files, Cognito, the
+                       token Lambda + API Gateway, CloudFront, and the VPC
+                       egress connector. Does NOT include the MicroVM image
+                       — see scripts/build-microvm-image.sh.
 samconfig.toml.example  copy to samconfig.toml and fill in (git-ignored)
 functions/
   token-vend/         token-vending Lambda (SigV4, Cognito sub, MicroVM lifecycle)
@@ -550,12 +795,18 @@ microvm/              MicroVM image
   agent-toolkit-bootstrap.sh  runs `aws configure agent-toolkit --yes` and
                             refreshes the aws-core plugin for Claude + Codex
 scripts/
-  deploy.sh           end-to-end deploy (web search + SAM + frontend + smoke test)
-  deploy-dev.sh        pushes a build to /dev.html on the same bucket/CDN — for
-                       quick frontend iteration without touching production
-  deploy-dev-image.sh  builds a separate, CLI-managed dev MicroVM image
-                       (ipad-claude-dev) from the working tree, for rapid
-                       microvm/ iteration without touching the production image
+  deploy.sh              Step 1: SAM build + deploy, then frontend sync
+  build-microvm-image.sh Step 2: builds the production MicroVM image via the
+                         AWS CLI (create/update-microvm-image + poll), and
+                         the AgentCore web-search gateway
+  smoke-test-vm.sh       Step 3 (optional): launches a throwaway MicroVM,
+                         checks it responds, tears it down
+  deploy-dev.sh          pushes a build to /dev.html on the same bucket/CDN —
+                         for quick frontend iteration without touching production
+  deploy-dev-image.sh    builds a separate dev MicroVM image
+                         (remote-developer-dev) from the working tree, for
+                         rapid microvm/ iteration without touching the
+                         production image
 tools/                optional break-glass utilities for a running MicroVM
   exec.js / exec.sh   interactive local shell into a user's MicroVM
   run-remote.js       non-interactive remote command runner

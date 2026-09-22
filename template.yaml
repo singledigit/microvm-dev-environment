@@ -22,13 +22,12 @@ Description: >
 # ─────────────────────────────────────────────────────────────────────────────
 
 Parameters:
-  # Two categories only: values genuinely unknowable until deploy time
-  # (MicrovmCodeUri, WebSearchGatewayUrl — deploy.sh computes/discovers these
-  # itself every run), and personalization knobs meant to be set once via
+  # Just one: a personalization knob meant to be set once via
   # `sam deploy --guided` or samconfig.toml's parameter_overrides, not by
-  # deploy.sh (LoginEmail). Everything else that's a fixed, non-personal
-  # choice (image name, memory tier, capabilities, base image version) is a
-  # literal directly on the MicrovmImage resource below — not a Parameter.
+  # deploy.sh. This template intentionally does NOT declare the MicroVM
+  # image as a resource here — see scripts/build-microvm-image.sh and the
+  # README's "Deploying" section for why, and for the separate, explicit
+  # step that builds it with the AWS CLI after this stack exists.
   LoginEmail:
     Type: String
     Default: you@example.com
@@ -37,19 +36,6 @@ Parameters:
       Cosmetic — set your own once via `sam deploy --guided` or
       samconfig.toml's parameter_overrides; CloudFormation retains it on
       every later deploy.sh run without deploy.sh ever passing it.
-  MicrovmCodeUri:
-    Type: String
-    Description: >-
-      s3://bucket/key of the zipped microvm/ source. deploy.sh computes this
-      from a content hash of the zip on every deploy — CloudFormation only
-      diffs property VALUES, and unlike AWS::Serverless::Function this
-      resource is NOT in SAM's local-file auto-upload list, so a content
-      hash in the key is what makes a real code change actually trigger a
-      rebuild instead of silently no-op'ing against a stale key.
-  WebSearchGatewayUrl:
-    Type: String
-    Default: ""
-    Description: AgentCore web-search MCP endpoint (created out-of-band by deploy.sh; see WebSearchGatewayRole below).
 
 Globals:
   Function:
@@ -67,7 +53,7 @@ Resources:
       CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      Tags: [{ Key: Name, Value: ipad-claude-vpc }]
+      Tags: [{ Key: Name, Value: remote-developer-vpc }]
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -279,7 +265,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      UserPoolName: ipad-claude-users
+      UserPoolName: remote-developer-users
       AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
       UsernameAttributes: [email]
       AutoVerifiedAttributes: [email]
@@ -302,7 +288,7 @@ Resources:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       UserPoolId: !Ref UserPool
-      ClientName: ipad-claude-web
+      ClientName: remote-developer-web
       GenerateSecret: false
       ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       AccessTokenValidity: 1
@@ -336,69 +322,20 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt ArtifactBucket.Arn
 
-  # The MicroVM image itself. Was hand-rolled via aws lambda-microvms
-  # create-microvm-image/update-microvm-image in deploy.sh — moved here once
-  # AWS::Serverless::MicrovmImage shipped (June 2026), which maps 1:1 onto
-  # those CLI flags and, crucially, fixes the CLI's worst footgun: `update-
-  # microvm-image` REPLACED the whole version config on every call, silently
-  # resetting capabilities/hooks/env vars unless you re-passed all of them
-  # every time. As an ordinary CFN resource, the full property set is always
-  # declared, that class of bug can't happen, and CloudFormation's own async
-  # stabilization replaces our manual CREATING-poll loop.
-  #
-  # BaseImageVersion and EgressNetworkConnectors below aren't arbitrary —
-  # they mirror what the CLI path was already resolving to by default
-  # (confirmed via get-microvm-image-version on the live image, which
-  # reported the resolved version as "1.0" — but this resource's input
-  # wants just the major version, "1"). Resources.MinimumMemoryInMiB is the
-  # one property deliberately NOT left at that old default: the CLI path
-  # never set it, so it silently floated at the platform default of 2048 MiB
-  # even though config.env.example used to carry an MVM_MEMORY=8192 that
-  # nothing ever actually consumed — the kind of dead, misleading config
-  # this migration is meant to make impossible. There is no config.env
-  # equivalent now; this literal IS the configuration.
-  #
-  # MinimumMemoryInMiB is a fixed-tier picker, not a free-form value —
-  # Lambda MicroVMs bill continuously at this baseline while running and
-  # auto-burst up to 4x it under load (billed per-second, only while
-  # actually bursting): 512→2048 peak, 1024→4096 peak, 2048→8192 peak,
-  # 4096→16384 peak, 8192→32768 peak. 4096 (4 GB baseline / 16 GB peak,
-  # 2 vCPU baseline / 8 vCPU peak) was chosen over the platform default of
-  # 2048 for headroom on sustained Claude Code / build workloads, without
-  # paying the 8192 tier's continuous rate for capacity mostly needed only
-  # in bursts. Change this literal directly to move tiers.
-  MicrovmImage:
-    Type: AWS::Serverless::MicrovmImage
-    Properties:
-      Name: remote-dev
-      CodeUri: !Ref MicrovmCodeUri
-      BuildRoleArn: !GetAtt MicroVmBuildRole.Arn
-      BaseImageArn: !Sub "arn:aws:lambda:${AWS::Region}:aws:microvm-image:al2023-1"
-      BaseImageVersion: "1"
-      AdditionalOsCapabilities: [ALL]
-      Resources:
-        - MinimumMemoryInMiB: 4096
-      EgressNetworkConnectors:
-        - !Sub "arn:aws:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
-      EnvironmentVariables:
-        S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
-        WEBSEARCH_GATEWAY_URL: !Ref WebSearchGatewayUrl
-      Hooks:
-        Port: 9000
-        MicrovmImageHooks:
-          Ready: ENABLED
-          ReadyTimeoutInSeconds: 180
-          Validate: ENABLED
-          ValidateTimeoutInSeconds: 300
-        MicrovmHooks:
-          Run: ENABLED
-          RunTimeoutInSeconds: 10
-          Resume: ENABLED
-          ResumeTimeoutInSeconds: 10
-          Suspend: ENABLED
-          SuspendTimeoutInSeconds: 10
-          Terminate: ENABLED
-          TerminateTimeoutInSeconds: 10
+  # NOTE: the MicroVM image itself is deliberately NOT a resource in this
+  # template. AWS SAM briefly supported it as AWS::Serverless::MicrovmImage,
+  # but that path has two real problems for a teaching repo: (1) its CodeUri
+  # requires an S3 object that already exists, with no local-file support
+  # and no default — so a first-ever deploy can't succeed at all without a
+  # separate bootstrap dance, hiding a real step behind script cleverness;
+  # (2) CloudFormation's stabilization wait for this resource type can time
+  # out on a genuinely healthy build (HandlerErrorCode: NotStabilized),
+  # failing a deploy that was actually still succeeding in the background.
+  # MicroVmBuildRole above still exists — the CLI build step
+  # (scripts/build-microvm-image.sh) uses it directly, no different from
+  # how a CFN resource would have. See the README's "Stage 3" for the full,
+  # explicit aws lambda-microvms create-microvm-image / update-microvm-image
+  # walkthrough this template intentionally leaves as its own visible step.
 
   # Permissions boundary for roles created FROM INSIDE the sandbox. The
   # execution role may create/manage IAM roles only if the new role carries
@@ -409,12 +346,21 @@ Resources:
   # deliberately mirror the execution role's ScopedIamWrites policy so that
   # roles created by created roles are capped identically (self-propagating).
   # Name is fixed (not stack-derived) because the in-VM CLAUDE.md briefing
-  # must be able to state the ARN statically — repo convention, same as the
-  # hardcoded /ipad-claude/* SSM prefix and function name.
+  # must be able to state the ARN pattern without querying CloudFormation —
+  # repo convention, same as the hardcoded /remote-developer/* SSM prefix
+  # and function name. It DOES include ${AWS::Region}: IAM is a global,
+  # account-wide namespace (no region field in the ARN itself), so a bare
+  # "remote-developer-sandbox-boundary" collides the moment this stack is
+  # deployed a second time in the same account under a different region —
+  # confirmed the hard way (CloudFormation's early-validation hook rejects
+  # the changeset before creating anything). The briefing tells the model to
+  # derive the region itself (same pattern already used for the account id
+  # via `aws sts get-caller-identity`), so this stays deploy-agnostic
+  # without needing any new plumbing into the image.
   SandboxPermissionsBoundary:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: ipad-claude-sandbox-boundary
+      ManagedPolicyName: !Sub "remote-developer-sandbox-boundary-${AWS::Region}"
       Description: Caps IAM roles created from inside the sandbox at sandbox privilege level.
       PolicyDocument:
         Version: "2012-10-17"
@@ -438,7 +384,7 @@ Resources:
             Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
             Condition:
               StringEquals:
-                iam:PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
+                iam:PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/remote-developer-sandbox-boundary-${AWS::Region}"
           - Sid: RoleLifecycle
             Effect: Allow
             Action: [iam:DeleteRole, iam:UpdateRole, iam:UpdateRoleDescription, iam:UpdateAssumeRolePolicy, iam:TagRole, iam:UntagRole, iam:CreateServiceLinkedRole]
@@ -454,7 +400,7 @@ Resources:
           - Sid: DenyBoundaryTamper
             Effect: Deny
             Action: [iam:CreatePolicyVersion, iam:DeletePolicy, iam:DeletePolicyVersion, iam:SetDefaultPolicyVersion]
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/ipad-claude-sandbox-boundary"
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/remote-developer-sandbox-boundary-${AWS::Region}"
           - Sid: DenyBoundaryRemoval
             Effect: Deny
             Action: iam:DeleteRolePermissionsBoundary
@@ -462,7 +408,7 @@ Resources:
           - Sid: DenyTouchSandboxInfra
             Effect: Deny
             Action: iam:*
-            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/remote-developer-*"
 
   # MicroVM execution role — the credential the sandbox operates with.
   # AWS managed PowerUserAccess (full service access minus IAM/Orgs), plus
@@ -537,7 +483,7 @@ Resources:
         # propagates the same cap to roles it creates in turn. Escalation
         # paths are closed: no boundary-free role writes, no IAM users or
         # access keys (never granted), no editing/removing the boundary, no
-        # touching the sandbox's own ipad-claude-* roles.
+        # touching the sandbox's own remote-developer-* roles.
         - PolicyName: ScopedIamWrites
           PolicyDocument:
             Version: "2012-10-17"
@@ -580,7 +526,7 @@ Resources:
               - Sid: DenyTouchSandboxInfra
                 Effect: Deny
                 Action: iam:*
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ipad-claude-*"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/remote-developer-*"
 
   # ── Compute: token-vending Lambda + API ──────────────────────────────────────
   TokenApi:
@@ -603,26 +549,33 @@ Resources:
   TokenFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: ipad-claude-token-vend
+      FunctionName: remote-developer-token-vend
       CodeUri: functions/token-vend/
       Handler: index.handler
       Environment:
         Variables:
           ALLOWED_ORIGINS: "*"
-          IMAGE_ARN: !GetAtt MicrovmImage.ImageArn
+          # No IMAGE_ARN env var here on purpose: the image is built by a
+          # separate CLI step (scripts/build-microvm-image.sh) that runs
+          # AFTER this stack exists, so its ARN can't be known at stack
+          # deploy time the way !GetAtt would need. build-microvm-image.sh
+          # writes it to SSM instead, and index.js reads it fresh on every
+          # invocation (IMAGE_ARN_PARAM below) — the Lambda never needs to
+          # be redeployed when the image is rebuilt.
+          IMAGE_ARN_PARAM: /remote-developer/image-arn
           EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           NETWORK_CONNECTOR_ARN: !GetAtt VpcEgressConnector.Arn
           S3_FILES_FS_ID: !GetAtt S3FilesFileSystem.FileSystemId
           WORKSPACE_BUCKET_ARN: !GetAtt WorkspaceBucket.Arn
       Policies:
         # SAM policy templates first:
-        - SSMParameterWithSlashPrefixReadPolicy: { ParameterName: /ipad-claude/* }
+        - SSMParameterWithSlashPrefixReadPolicy: { ParameterName: /remote-developer/* }
         # Then inline for permissions with no policy-template equivalent:
         - Statement:
             - Sid: SsmWritePerUserState
               Effect: Allow
               Action: [ssm:PutParameter, ssm:GetParameter]
-              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ipad-claude/*"
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/remote-developer/*"
             - Sid: PerUserAccessPoints
               Effect: Allow
               Action: [s3files:CreateAccessPoint, s3files:GetAccessPoint, s3files:ListAccessPoints, s3files:DeleteAccessPoint]
@@ -655,7 +608,13 @@ Resources:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub "${AWS::StackName}-frontend-oac"
+        # CloudFront has no regional endpoints, so OAC names are a global,
+        # account-wide namespace too — ${AWS::StackName} alone collides
+        # across regions in the same account for the same reason
+        # WebSearchGatewayRole and SandboxPermissionsBoundary did (confirmed
+        # via CloudFormation's own AlreadyExists error on a second-region
+        # deploy). ${AWS::Region} makes it unique regardless.
+        Name: !Sub "${AWS::StackName}-frontend-oac-${AWS::Region}"
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -729,7 +688,7 @@ Resources:
   VpcEgressConnector:
     Type: AWS::Lambda::NetworkConnector
     Properties:
-      Name: ipad-claude-vpc-egress
+      Name: remote-developer-vpc-egress
       Configuration:
         VpcEgressConfiguration:
           SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
@@ -753,7 +712,13 @@ Resources:
   WebSearchGatewayRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AWS::StackName}-websearch-gw-role"
+      # IAM role names are a global, account-wide namespace (no region field),
+      # so ${AWS::StackName} alone isn't enough to keep this unique across
+      # regions in the same account when STACK_NAME itself is a hardcoded
+      # constant (see deploy.sh) — confirmed by CloudFormation's own
+      # early-validation NAME_CONFLICT_VALIDATION rejecting a second-region
+      # deploy. ${AWS::Region} makes it unique regardless.
+      RoleName: !Sub "${AWS::StackName}-websearch-gw-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -809,6 +774,7 @@ Outputs:
   WebSearchGatewayRoleArn:
     Description: IAM role used by the AgentCore web-search gateway (outbound connector auth).
     Value: !GetAtt WebSearchGatewayRole.Arn
-  MicrovmImageArn:
-    Description: ARN of the MicroVM image (created/updated as part of this stack).
-    Value: !GetAtt MicrovmImage.ImageArn
+  # No MicrovmImageArn output: the image isn't a resource this stack owns.
+  # Run scripts/build-microvm-image.sh after this stack deploys — it writes
+  # the image's ARN to SSM at /remote-developer/image-arn, which is what
+  # TokenFunction actually reads at runtime (see IMAGE_ARN_PARAM above).

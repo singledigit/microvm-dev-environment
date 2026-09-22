@@ -211,12 +211,16 @@ freedom here than in a typical local checkout, and different persistence rules.
   plus scoped IAM writes so you can deploy real stacks — `sam deploy`, CDK,
   CloudFormation with role creation all work. The guardrail is a permissions
   boundary: **any IAM role you create MUST carry the permissions boundary
-  `arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary`** (get the
-  account id from `aws sts get-caller-identity`), or the CreateRole call is
+  `arn:aws:iam::<account-id>:policy/remote-developer-sandbox-boundary-<region>`**
+  (get the account id from `aws sts get-caller-identity`, and the region from
+  `aws configure get region` or `$AWS_REGION` — this workspace's own stack
+  may be deployed in a different region than us-east-1, and IAM policy names
+  are a global, account-wide namespace, so the region suffix is required and
+  really is part of the name, not decoration), or the CreateRole call is
   denied with AccessDenied. How to attach it:
   - SAM: add to template.yaml — `Globals: { Function: { PermissionsBoundary:
-    arn:aws:iam::<account-id>:policy/ipad-claude-sandbox-boundary } }`, or
-    per-role via the role's `PermissionsBoundary` property.
+    arn:aws:iam::<account-id>:policy/remote-developer-sandbox-boundary-<region> } }`,
+    or per-role via the role's `PermissionsBoundary` property.
   - CDK: `new iam.Role(..., { permissionsBoundary: ManagedPolicy.fromManagedPolicyArn(...) })`
     or the `@aws-cdk/core:permissionsBoundary` context key.
   - CLI: `aws iam create-role --permissions-boundary <that-arn> ...`
@@ -224,7 +228,7 @@ freedom here than in a typical local checkout, and different persistence rules.
   is almost always why — fix the template, don't retry blindly.
 - Hard limits (by design, do not try to work around them): no IAM users or
   access keys, no editing/removing the boundary itself, no touching the
-  sandbox's own `ipad-claude-*` roles, and roles you create are capped at
+  sandbox's own `remote-developer-*` roles, and roles you create are capped at
   this sandbox's own privilege level.
 - With great power: this role is shared across every user's VM and is billed
   to the sandbox owner's account. Create resources deliberately, prefer
@@ -253,6 +257,23 @@ EOF
 # Bedrock — uses execution role via IMDSv2
 ENV HOME=/home/coder
 ENV S3_FILES_FS_ID=__S3_FILES_FS_ID__
+# The region this STACK is actually deployed in (substituted by
+# build-microvm-image.sh, same mechanism as S3_FILES_FS_ID above) — used
+# only for calls that must hit resources living wherever this stack
+# deployed, e.g. the get-microvm self-lookup in hooks.js. Deliberately NOT
+# used for AWS_REGION below: Claude Code's Bedrock calls need us-east-1
+# specifically for the current Claude inference profiles regardless of
+# where this stack itself deploys.
+ENV DEPLOY_REGION=__DEPLOY_REGION__
+# The region the AgentCore web-search Gateway actually lives in — NOT
+# necessarily the same as DEPLOY_REGION. The web-search CONNECTOR (not
+# AgentCore Gateway generally, which is broadly available) is only enabled
+# per-account in specific regions today; build-microvm-image.sh creates the
+# gateway in WEBSEARCH_REGION (us-east-1 by default) regardless of which
+# region the rest of the stack deploys to. Used only for SigV4-signing the
+# web-search MCP proxy (mcp-config.js, codex-mcp-config.sh) — nothing else
+# reads it.
+ENV WEBSEARCH_REGION=__WEBSEARCH_REGION__
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 # Default model: Opus (Fable requires US data residency; users may be outside US).

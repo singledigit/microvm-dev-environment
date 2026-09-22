@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Non-interactive command runner for a user's rDev MicroVM (SHELL_INGRESS).
 // Usage: node tools/run-remote.js --user <email> 'command' [timeout-seconds]
-//   (or set IPAD_CLAUDE_USER=<email> instead of --user)
+//   (or set REMOTE_DEVELOPER_USER=<email> instead of --user)
 // Prints the command's output between BEGIN/END markers and exits.
 
 const path = require('path');

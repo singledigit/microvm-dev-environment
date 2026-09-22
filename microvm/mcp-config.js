@@ -12,6 +12,16 @@ const path = require('path');
 const [, , configPath, gatewayUrl, serverName = 'web-search'] = process.argv;
 if (!gatewayUrl || !configPath) process.exit(0);
 
+// SigV4 signing region for the gateway call — this MUST match the region the
+// AgentCore Gateway was actually created in. That's WEBSEARCH_REGION, NOT
+// DEPLOY_REGION (where the rest of the stack lives) or AWS_REGION (pinned to
+// us-east-1 for Bedrock/Claude Code model access) — the web-search connector
+// is only enabled per-account in specific regions today, so
+// build-microvm-image.sh creates the gateway in its own region
+// (WEBSEARCH_REGION, us-east-1 by default) independent of where the stack
+// itself deploys. See the Dockerfile's comment on WEBSEARCH_REGION.
+const signingRegion = process.env.WEBSEARCH_REGION || 'us-east-1';
+
 let cfg = {};
 try {
   cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -30,7 +40,7 @@ cfg.mcpServers[serverName] = {
     'mcp-proxy-for-aws@1.6.3',
     gatewayUrl,
     '--service', 'bedrock-agentcore',
-    '--region', 'us-east-1',
+    '--region', signingRegion,
   ],
 };
 

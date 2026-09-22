@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(unset CDPATH; cd "$SCRIPT_DIR/.." && pwd)"
-STACK_NAME="ipad-claude"
+STACK_NAME="remote-developer"
 
 out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
@@ -24,7 +24,7 @@ REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}
 BUILD_STAMP="$(git -C "$ROOT_DIR" rev-parse --short HEAD)-$(date +%H%M%S)"
 APP_CONFIG_JSON="{\"tokenApiUrl\":\"$TOKEN_API_URL\",\"region\":\"$REGION\",\"userPoolId\":\"$USER_POOL_ID\",\"userPoolClientId\":\"$USER_POOL_CLIENT_ID\",\"build\":\"$BUILD_STAMP\"}"
 
-RENDERED=/tmp/ipad-claude-dev.html
+RENDERED=/tmp/remote-developer-dev.html
 sed "s|<script>window.APP_CONFIG = {}; /\* APP_CONFIG_PLACEHOLDER \*/</script>|<script>window.APP_CONFIG = $APP_CONFIG_JSON;</script>|" \
   "$ROOT_DIR/frontend/index.html" > "$RENDERED"
 
