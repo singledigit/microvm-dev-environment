@@ -278,8 +278,8 @@ ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV AWS_REGION=us-east-1
 # Default model: Opus (Fable requires US data residency; users may be outside US).
 # Fable available via: /model us.anthropic.claude-fable-5-1
-ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5
-ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
+ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5-5
+ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5-5
 ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
 ENV ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ENV ANTHROPIC_DEFAULT_FABLE_MODEL=us.anthropic.claude-fable-5-1

@@ -60,7 +60,7 @@ flowchart TD
   token. Hand-rolled SigV4, so it's immune to AWS CLI command-name churn.
 - **MicroVM image** — Amazon Linux 2023 + Node, Python 3.13, the AWS CLI, `uv`,
   Claude Code, Codex CLI, and Kiro CLI. `terminal.js` is a WebSocket PTY server.
-  `claude` defaults to Opus 5, `claude-model` selects any current Claude family
+  `claude` defaults to Opus 5.5, `claude-model` selects any current Claude family
   model, and Codex uses Amazon Bedrock's current supported OpenAI catalog. The
   image refreshes a managed MicroVM briefing for each CLI after the user's home
   mount, without replacing CLI history, preferences, or Kiro login state.
@@ -90,7 +90,7 @@ home directory (an S3 Files access point scoped to their `sub`). Adding a user
 in the pool is all it takes — their first login provisions their VM and home on
 demand.
 
-Claude Code defaults to **Claude Opus 5**. Use `claude-model opus`,
+Claude Code defaults to **Claude Opus 5.5**. Use `claude-model opus`,
 `claude-model sonnet`, `claude-model haiku`, or `claude-model fable` for the
 latest available model in each Claude family. Codex `0.154.0` uses Amazon
 Bedrock's current OpenAI catalog: GPT-6 Astra plus GPT-5.6 Sol, Terra, and

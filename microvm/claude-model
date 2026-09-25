@@ -9,7 +9,7 @@ if [ "$#" -eq 0 ]; then
 fi
 
 case "$1" in
-  opus)   model='us.anthropic.claude-opus-5' ;;
+  opus)   model='us.anthropic.claude-opus-5-5' ;;
   sonnet) model='us.anthropic.claude-sonnet-5' ;;
   haiku)  model='us.anthropic.claude-haiku-4-5-20251001-v1:0' ;;
   fable)  model='us.anthropic.claude-fable-5-1' ;;
